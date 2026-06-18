@@ -856,7 +856,11 @@ async def morning_job(context):
                     reste=f"{reste:,.2f}",
                     pct_restant=pct_restant,
                     message=motiv)
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+            yt_btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)
+            ]])
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML",
+                                           reply_markup=yt_btn)
         except Exception as exc:
             log.error("Morning job user %s : %s", user_id, exc)
 
@@ -875,7 +879,11 @@ async def daily_report_job(context):
             date_str = datetime.datetime.now().strftime("%d/%m/%Y")
             header   = t("daily_report_header", lang, date=date_str)
             msg      = f"{header}\n\n" + total_summary(rows, lang, user_id=user_id)
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+            yt_btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)
+            ]])
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML",
+                                           reply_markup=yt_btn)
         except Exception as exc:
             log.error("Daily report user %s : %s", user_id, exc)
 
