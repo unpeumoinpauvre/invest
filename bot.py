@@ -531,7 +531,6 @@ def init_db():
                 )
             """)
         conn.commit()
-    init_db_debts()
     log.info("DB initialisée.")
 
 
@@ -1275,6 +1274,7 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 def main():
     init_db()
+    init_db_debts()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Jobs planifiés (UTC — Paris est UTC+2 en été)
