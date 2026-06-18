@@ -1272,136 +1272,6 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
-    init_db()
-    init_db_debts()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Jobs planifiés (UTC — Paris est UTC+2 en été)
-    app.job_queue.run_daily(
-        morning_job,
-        time=datetime.time(hour=4, minute=0, tzinfo=datetime.timezone.utc),  # 6h00 Paris
-        name="morning_job",
-    )
-    app.job_queue.run_daily(
-        daily_report_job,
-        time=datetime.time(hour=18, minute=30, tzinfo=datetime.timezone.utc),  # 20h30 Paris
-        name="daily_report",
-    )
-
-    # /start + /langue → même conversation de sélection de langue
-    lang_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start",  cmd_start),
-            CommandHandler("langue", cmd_langue),
-        ],
-        states={
-            LANG_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lang_choice)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    # /add
-    add_conv = ConversationHandler(
-        entry_points=[CommandHandler("add", add_start)],
-        states={
-            ADD_NOM:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_nom)],
-            ADD_TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_type)],
-            ADD_DEVISE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_devise)],
-            ADD_DATE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_date)],
-            ADD_MISE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_mise)],
-            ADD_VALEUR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_valeur)],
-            ADD_RENDEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rendement)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    # /update
-    update_conv = ConversationHandler(
-        entry_points=[CommandHandler("update", update_start)],
-        states={
-            UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, update_nom)],
-            UPDATE_VALEUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_valeur)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    # /sell
-    sell_conv = ConversationHandler(
-        entry_points=[CommandHandler("sell", sell_start)],
-        states={SELL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_nom)]},
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    # /delete
-    delete_conv = ConversationHandler(
-        entry_points=[CommandHandler("delete", delete_start)],
-        states={DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_nom)]},
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    # /objectif
-    objectif_conv = ConversationHandler(
-        entry_points=[CommandHandler("objectif", cmd_objectif)],
-        states={OBJECTIF_MONTANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, objectif_montant)]},
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-
-    app.add_handler(lang_conv)
-    app.add_handler(add_conv)
-    app.add_handler(update_conv)
-    app.add_handler(sell_conv)
-    app.add_handler(delete_conv)
-    app.add_handler(objectif_conv)
-
-    app.add_handler(CommandHandler("list",      cmd_list))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("total",     cmd_total))
-    app.add_handler(CommandHandler("chart",     cmd_chart))
-    app.add_handler(CommandHandler("charts",    cmd_charts))
-    app.add_handler(CommandHandler("liberte",   cmd_liberte))
-    app.add_handler(CommandHandler("dettes",    cmd_dettes))
-
-    # /dette_add
-    dette_add_conv = ConversationHandler(
-        entry_points=[CommandHandler("dette_add", dette_add_start)],
-        states={
-            DEBT_NOM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_nom)],
-            DEBT_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_type)],
-            DEBT_DEVISE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_devise)],
-            DEBT_MONTANT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_montant)],
-            DEBT_TAUX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_taux)],
-            DEBT_ECHEANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_echeance)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-    dette_update_conv = ConversationHandler(
-        entry_points=[CommandHandler("dette_update", dette_update_start)],
-        states={
-            DEBT_UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_nom)],
-            DEBT_UPDATE_MONTANT:[MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_montant)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-    dette_delete_conv = ConversationHandler(
-        entry_points=[CommandHandler("dette_delete", dette_delete_start)],
-        states={
-            DEBT_DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_delete_nom)],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-    )
-    app.add_handler(dette_add_conv)
-    app.add_handler(dette_update_conv)
-    app.add_handler(dette_delete_conv)
-
-    log.info("Bot patrimoine démarré — 6h00 morning job, 20h30 rapport quotidien.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
-
-
 # =========================================================================== #
 # DETTES / CRÉDITS
 # =========================================================================== #
@@ -1697,4 +1567,136 @@ async def dette_delete_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg   = t("debt_deleted", lang, nom=nom) if count else t("not_found", lang, nom=nom)
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+
+
+def main():
+    init_db()
+    init_db_debts()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Jobs planifiés (UTC — Paris est UTC+2 en été)
+    app.job_queue.run_daily(
+        morning_job,
+        time=datetime.time(hour=4, minute=0, tzinfo=datetime.timezone.utc),  # 6h00 Paris
+        name="morning_job",
+    )
+    app.job_queue.run_daily(
+        daily_report_job,
+        time=datetime.time(hour=18, minute=30, tzinfo=datetime.timezone.utc),  # 20h30 Paris
+        name="daily_report",
+    )
+
+    # /start + /langue → même conversation de sélection de langue
+    lang_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start",  cmd_start),
+            CommandHandler("langue", cmd_langue),
+        ],
+        states={
+            LANG_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lang_choice)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /add
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", add_start)],
+        states={
+            ADD_NOM:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_nom)],
+            ADD_TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_type)],
+            ADD_DEVISE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_devise)],
+            ADD_DATE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_date)],
+            ADD_MISE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_mise)],
+            ADD_VALEUR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_valeur)],
+            ADD_RENDEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rendement)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /update
+    update_conv = ConversationHandler(
+        entry_points=[CommandHandler("update", update_start)],
+        states={
+            UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, update_nom)],
+            UPDATE_VALEUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_valeur)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /sell
+    sell_conv = ConversationHandler(
+        entry_points=[CommandHandler("sell", sell_start)],
+        states={SELL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_nom)]},
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /delete
+    delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("delete", delete_start)],
+        states={DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_nom)]},
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /objectif
+    objectif_conv = ConversationHandler(
+        entry_points=[CommandHandler("objectif", cmd_objectif)],
+        states={OBJECTIF_MONTANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, objectif_montant)]},
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    app.add_handler(lang_conv)
+    app.add_handler(add_conv)
+    app.add_handler(update_conv)
+    app.add_handler(sell_conv)
+    app.add_handler(delete_conv)
+    app.add_handler(objectif_conv)
+
+    app.add_handler(CommandHandler("list",      cmd_list))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("total",     cmd_total))
+    app.add_handler(CommandHandler("chart",     cmd_chart))
+    app.add_handler(CommandHandler("charts",    cmd_charts))
+    app.add_handler(CommandHandler("liberte",   cmd_liberte))
+    app.add_handler(CommandHandler("dettes",    cmd_dettes))
+
+    # /dette_add
+    dette_add_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_add", dette_add_start)],
+        states={
+            DEBT_NOM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_nom)],
+            DEBT_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_type)],
+            DEBT_DEVISE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_devise)],
+            DEBT_MONTANT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_montant)],
+            DEBT_TAUX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_taux)],
+            DEBT_ECHEANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_echeance)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    dette_update_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_update", dette_update_start)],
+        states={
+            DEBT_UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_nom)],
+            DEBT_UPDATE_MONTANT:[MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_montant)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    dette_delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_delete", dette_delete_start)],
+        states={
+            DEBT_DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_delete_nom)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    app.add_handler(dette_add_conv)
+    app.add_handler(dette_update_conv)
+    app.add_handler(dette_delete_conv)
+
+    log.info("Bot patrimoine démarré — 6h00 morning job, 20h30 rapport quotidien.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
 
