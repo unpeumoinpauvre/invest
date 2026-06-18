@@ -60,7 +60,10 @@ log = logging.getLogger("upmp-portfolio")
  ADD_NOM, ADD_TYPE, ADD_DEVISE, ADD_DATE, ADD_MISE, ADD_VALEUR, ADD_RENDEMENT,
  UPDATE_NOM, UPDATE_VALEUR,
  SELL_NOM, DELETE_NOM,
- OBJECTIF_MONTANT) = range(13)
+ OBJECTIF_MONTANT,
+ DEBT_NOM, DEBT_TYPE, DEBT_DEVISE, DEBT_MONTANT, DEBT_TAUX, DEBT_ECHEANCE,
+ DEBT_UPDATE_NOM, DEBT_UPDATE_MONTANT,
+ DEBT_DELETE_NOM) = range(22)
 
 TYPES = ["Crypto", "Crowdlending", "DeFi", "Minage", "Immobilier", "RWA",
          "Pool liquidité", "Vault", "Actions", "Autre"]
@@ -351,7 +354,11 @@ T = {
             "/liberte — Voir ta barre de progression\n"
             "/list — Liste des investissements\n"
             "/langue — Changer de langue\n"
-            "/delete — Supprimer un investissement"
+            "/delete — Supprimer un investissement\n"
+            "/dettes — Voir mes dettes\n"
+            "/dette_add — Ajouter une dette\n"
+            "/dette_update — Mettre à jour une dette\n"
+            "/dette_delete — Supprimer une dette"
         ),
         "en": (
             "/add — Add an investment\n"
@@ -365,8 +372,77 @@ T = {
             "/liberte — View your progress bar\n"
             "/list — List investments\n"
             "/langue — Change language\n"
-            "/delete — Delete an investment"
+            "/delete — Delete an investment\n"
+            "/dettes — View my debts\n"
+            "/dette_add — Add a debt\n"
+            "/dette_update — Update a debt\n"
+            "/dette_delete — Delete a debt"
         ),
+    },
+
+    "debt_title": {
+        "fr": "💳 <b>Mes dettes / crédits</b>",
+        "en": "💳 <b>My debts / loans</b>",
+    },
+    "debt_none": {
+        "fr": "Aucune dette enregistrée. Utilise /dette_add pour en ajouter.",
+        "en": "No debts recorded. Use /dette_add to add one.",
+    },
+    "debt_add_nom": {
+        "fr": "📝 Nom de la dette / crédit ? (ex: Crédit immobilier, Crédit auto...)",
+        "en": "📝 Name of the debt/loan? (e.g. Mortgage, Car loan...)",
+    },
+    "debt_add_type": {
+        "fr": "Type de dette ?",
+        "en": "Type of debt?",
+    },
+    "debt_add_devise": {
+        "fr": "Devise ?",
+        "en": "Currency?",
+    },
+    "debt_add_montant": {
+        "fr": "Montant restant dû en {sym} ?",
+        "en": "Remaining amount owed in {sym}?",
+    },
+    "debt_add_taux": {
+        "fr": "Taux d'intérêt annuel en % ? (ex: 3.5 — Entrée pour ignorer)",
+        "en": "Annual interest rate in %? (e.g. 3.5 — Enter to skip)",
+    },
+    "debt_add_echeance": {
+        "fr": "Date de fin / échéance ? (JJ/MM/AAAA — Entrée pour ignorer)",
+        "en": "End date / maturity? (DD/MM/YYYY — Enter to skip)",
+    },
+    "debt_added": {
+        "fr": "✅ Dette ajoutée !",
+        "en": "✅ Debt added!",
+    },
+    "debt_updated": {
+        "fr": "✅ Dette mise à jour !",
+        "en": "✅ Debt updated!",
+    },
+    "debt_deleted": {
+        "fr": "🗑️ '{nom}' supprimée.",
+        "en": "🗑️ '{nom}' deleted.",
+    },
+    "debt_update_which": {
+        "fr": "Quelle dette mettre à jour ?",
+        "en": "Which debt to update?",
+    },
+    "debt_delete_which": {
+        "fr": "⚠️ Quelle dette supprimer ?",
+        "en": "⚠️ Which debt to delete?",
+    },
+    "debt_new_montant": {
+        "fr": "Nouveau montant restant dû en {sym} ?",
+        "en": "New remaining amount owed in {sym}?",
+    },
+    "patrimoine_net": {
+        "fr": "🏦 Patrimoine NET (investissements − dettes)",
+        "en": "🏦 NET wealth (investments − debts)",
+    },
+    "total_dettes": {
+        "fr": "💳 Total dettes",
+        "en": "💳 Total debts",
     },
 }
 
@@ -455,6 +531,7 @@ def init_db():
                 )
             """)
         conn.commit()
+    init_db_debts()
     log.info("DB initialisée.")
 
 
@@ -645,7 +722,7 @@ def row_summary(r, lang="fr"):
     return "\n".join(lines)
 
 
-def total_summary(rows, lang="fr"):
+def total_summary(rows, lang="fr", user_id=None):
     rate = get_eur_usd()
     total_mise_e = total_val_e = 0
     poids = []
@@ -683,6 +760,14 @@ def total_summary(rows, lang="fr"):
     if proj_e is not None:
         msg += f"\n{t('annual_proj', lang)} : <b>{proj_e:+,.2f} €/an  ({proj_e*rate:+,.2f} $/an)</b>"
         msg += f"\n{t('monthly_proj', lang)} : <b>{proj_e/12:+,.2f} €/mois  ({proj_e*rate/12:+,.2f} $/mois)</b>"
+    # Dettes
+    total_dettes_e = total_debts_eur(user_id) if user_id else 0
+    rate = get_eur_usd()
+    if total_dettes_e > 0:
+        patrimoine_net = total_val_e - total_dettes_e
+        msg += f"\n\n{t('total_dettes', lang)} : <b>-{total_dettes_e:,.2f} €  (-{total_dettes_e*rate:,.2f} $)</b>"
+        emoji_net = "🟢" if patrimoine_net >= 0 else "🔴"
+        msg += f"\n{emoji_net} {t('patrimoine_net', lang)} : <b>{patrimoine_net:+,.2f} €  ({patrimoine_net*rate:+,.2f} $)</b>"
     msg += f"\n\n{t('active_positions', lang)} : {len(rows)}"
     return msg
 
@@ -747,18 +832,20 @@ async def morning_job(context):
         rows     = db_get_all(user_id, include_sold=False)
         if not rows:
             continue
-        total_val_e = sum(to_eur(float(r["valeur"] or r["mise"]), r.get("devise") or "EUR")
+        total_val_e  = sum(to_eur(float(r["valeur"] or r["mise"]), r.get("devise") or "EUR")
                           for r in rows)
+        total_dette_e = total_debts_eur(user_id)
+        patrimoine_net_e = total_val_e - total_dette_e
         if not objectif:
             continue
-        pct          = min(total_val_e / objectif * 100, 100)
-        reste        = max(objectif - total_val_e, 0)
+        pct          = min(patrimoine_net_e / objectif * 100, 100)
+        reste        = max(objectif - patrimoine_net_e, 0)
         pct_restant  = max(100 - pct, 0)
         barre        = make_progress_bar(pct)
         motiv        = random.choice(T["morning_motivation"][lang])
         try:
             msg = t("morning_msg", lang,
-                    valeur=f"{total_val_e:,.2f}",
+                    valeur=f"{patrimoine_net_e:,.2f}",
                     objectif=f"{objectif:,.2f}",
                     barre=barre, pct=pct,
                     reste=f"{reste:,.2f}",
@@ -782,7 +869,7 @@ async def daily_report_job(context):
         try:
             date_str = datetime.datetime.now().strftime("%d/%m/%Y")
             header   = t("daily_report_header", lang, date=date_str)
-            msg      = f"{header}\n\n" + total_summary(rows, lang)
+            msg      = f"{header}\n\n" + total_summary(rows, lang, user_id=user_id)
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         except Exception as exc:
             log.error("Daily report user %s : %s", user_id, exc)
@@ -933,7 +1020,7 @@ async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text(t("no_active", lang))
         return
-    await update.message.reply_text(total_summary(rows, lang), parse_mode="HTML")
+    await update.message.reply_text(total_summary(rows, lang, user_id=uid(update)), parse_mode="HTML")
 
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1273,6 +1360,39 @@ def main():
     app.add_handler(CommandHandler("chart",     cmd_chart))
     app.add_handler(CommandHandler("charts",    cmd_charts))
     app.add_handler(CommandHandler("liberte",   cmd_liberte))
+    app.add_handler(CommandHandler("dettes",    cmd_dettes))
+
+    # /dette_add
+    dette_add_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_add", dette_add_start)],
+        states={
+            DEBT_NOM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_nom)],
+            DEBT_TYPE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_type)],
+            DEBT_DEVISE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_devise)],
+            DEBT_MONTANT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_montant)],
+            DEBT_TAUX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_taux)],
+            DEBT_ECHEANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_add_echeance)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    dette_update_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_update", dette_update_start)],
+        states={
+            DEBT_UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_nom)],
+            DEBT_UPDATE_MONTANT:[MessageHandler(filters.TEXT & ~filters.COMMAND, dette_update_montant)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    dette_delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("dette_delete", dette_delete_start)],
+        states={
+            DEBT_DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, dette_delete_nom)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+    app.add_handler(dette_add_conv)
+    app.add_handler(dette_update_conv)
+    app.add_handler(dette_delete_conv)
 
     log.info("Bot patrimoine démarré — 6h00 morning job, 20h30 rapport quotidien.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -1280,3 +1400,301 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =========================================================================== #
+# DETTES / CRÉDITS
+# =========================================================================== #
+
+DEBT_TYPES = ["Crédit immobilier", "Crédit auto", "Crédit conso", "Prêt perso",
+              "Découvert", "Carte de crédit", "Autre"]
+
+# --------------------------------------------------------------------------- #
+# DB dettes
+# --------------------------------------------------------------------------- #
+def init_db_debts():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS debts (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     BIGINT NOT NULL,
+                    nom         TEXT NOT NULL,
+                    type        TEXT,
+                    devise      TEXT DEFAULT 'EUR',
+                    montant     NUMERIC(14,2) NOT NULL,
+                    taux        NUMERIC(6,2),
+                    echeance    DATE,
+                    created_at  TIMESTAMP DEFAULT NOW(),
+                    updated_at  TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_debts_user ON debts(user_id)
+            """)
+        conn.commit()
+
+
+def debt_add(user_id, nom, type_, devise, montant, taux, echeance):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO debts (user_id, nom, type, devise, montant, taux, echeance)
+                VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (user_id, nom, type_, devise, montant, taux, echeance))
+            row = cur.fetchone()
+        conn.commit()
+    return row["id"]
+
+
+def debt_update(user_id, nom, montant):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE debts SET montant=%s, updated_at=NOW()
+                WHERE user_id=%s AND LOWER(nom)=LOWER(%s)
+            """, (montant, user_id, nom))
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
+def debt_delete(user_id, nom):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM debts WHERE user_id=%s AND LOWER(nom)=LOWER(%s)",
+                        (user_id, nom))
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
+def debt_get_all(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM debts WHERE user_id=%s ORDER BY nom", (user_id,))
+            return cur.fetchall()
+
+
+def debt_get_one(user_id, nom):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM debts WHERE user_id=%s AND LOWER(nom)=LOWER(%s)",
+                        (user_id, nom))
+            return cur.fetchone()
+
+
+def debt_list_names(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT nom FROM debts WHERE user_id=%s ORDER BY nom", (user_id,))
+            return [r["nom"] for r in cur.fetchall()]
+
+
+def total_debts_eur(user_id):
+    """Retourne le total des dettes converties en EUR."""
+    rows = debt_get_all(user_id)
+    return sum(to_eur(float(r["montant"]), r.get("devise") or "EUR") for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# Formatage d'une dette
+# --------------------------------------------------------------------------- #
+def debt_row_summary(r, lang="fr"):
+    devise = r.get("devise") or "EUR"
+    montant_n = float(r["montant"])
+    montant_e = to_eur(montant_n, devise)
+    rate      = get_eur_usd()
+    sym       = "$" if devise == "USD" else "€"
+
+    lines = [
+        f"💳 <b>{r['nom']}</b> [{r['type'] or '—'}] — {devise}",
+        f"  💸 Montant restant : {montant_n:,.2f} {sym}  ({montant_e:,.2f} € / {montant_e*rate:,.2f} $)",
+    ]
+    if r.get("taux"):
+        cout_annuel = montant_e * float(r["taux"]) / 100
+        lines.append(f"  📅 Taux : {float(r['taux']):.2f}%/an  (coût ≈ {cout_annuel:,.2f} €/an)")
+    if r.get("echeance"):
+        jours = (r["echeance"] - datetime.date.today()).days
+        if jours > 0:
+            lines.append(f"  🗓️  Échéance : {r['echeance'].strftime('%d/%m/%Y')}  ({jours} jours restants)")
+        else:
+            lines.append(f"  🗓️  Échéance : {r['echeance'].strftime('%d/%m/%Y')}  (⚠️ échue)")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Commande /dettes
+# --------------------------------------------------------------------------- #
+async def cmd_dettes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    rows = debt_get_all(uid(update))
+    if not rows:
+        await update.message.reply_text(t("debt_none", lang))
+        return
+    rate        = get_eur_usd()
+    total_e     = total_debts_eur(uid(update))
+    header      = f"{t('debt_title', lang)}\n"
+    await update.message.reply_text(header, parse_mode="HTML")
+    for r in rows:
+        await update.message.reply_text(debt_row_summary(r, lang), parse_mode="HTML")
+    await update.message.reply_text(
+        f"💳 <b>Total dettes : {total_e:,.2f} € ({total_e*rate:,.2f} $)</b>",
+        parse_mode="HTML"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# /dette_add
+# --------------------------------------------------------------------------- #
+async def dette_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    await update.message.reply_text(t("debt_add_nom", lang), reply_markup=ReplyKeyboardRemove())
+    return DEBT_NOM
+
+async def dette_add_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    context.user_data["debt_nom"] = update.message.text.strip()
+    keyboard = [[ty] for ty in DEBT_TYPES]
+    await update.message.reply_text(
+        t("debt_add_type", lang),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DEBT_TYPE
+
+async def dette_add_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    context.user_data["debt_type"] = update.message.text.strip()
+    keyboard = [["EUR (€)", "USD ($)"]]
+    await update.message.reply_text(
+        t("debt_add_devise", lang),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DEBT_DEVISE
+
+async def dette_add_devise(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip()
+    context.user_data["debt_devise"] = "USD" if "USD" in txt or "$" in txt else "EUR"
+    sym  = "$" if context.user_data["debt_devise"] == "USD" else "€"
+    await update.message.reply_text(
+        t("debt_add_montant", lang, sym=sym),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return DEBT_MONTANT
+
+async def dette_add_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    try:
+        context.user_data["debt_montant"] = float(
+            update.message.text.replace(",", ".").replace("€","").replace("$","").strip()
+        )
+    except ValueError:
+        await update.message.reply_text(t("invalid_amount", lang))
+        return DEBT_MONTANT
+    await update.message.reply_text(t("debt_add_taux", lang))
+    return DEBT_TAUX
+
+async def dette_add_taux(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip()
+    context.user_data["debt_taux"] = None
+    if txt:
+        try:
+            context.user_data["debt_taux"] = float(txt.replace(",",".").replace("%","").strip())
+        except ValueError:
+            pass
+    await update.message.reply_text(t("debt_add_echeance", lang))
+    return DEBT_ECHEANCE
+
+async def dette_add_echeance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip().lower()
+    context.user_data["debt_echeance"] = None
+    if txt and txt not in ("", "skip", "ignorer"):
+        try:
+            context.user_data["debt_echeance"] = datetime.datetime.strptime(txt, "%d/%m/%Y").date()
+        except ValueError:
+            pass
+    d   = context.user_data
+    iid = debt_add(uid(update), d["debt_nom"], d["debt_type"], d["debt_devise"],
+                   d["debt_montant"], d["debt_taux"], d["debt_echeance"])
+    r   = debt_get_one(uid(update), d["debt_nom"])
+    await update.message.reply_text(
+        f"{t('debt_added', lang)}\n\n" + debt_row_summary(r, lang),
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------- #
+# /dette_update
+# --------------------------------------------------------------------------- #
+async def dette_update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    noms = debt_list_names(uid(update))
+    if not noms:
+        await update.message.reply_text(t("debt_none", lang))
+        return ConversationHandler.END
+    keyboard = [[n] for n in noms]
+    await update.message.reply_text(
+        t("debt_update_which", lang),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DEBT_UPDATE_NOM
+
+async def dette_update_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    context.user_data["debt_update_nom"] = update.message.text.strip()
+    r   = debt_get_one(uid(update), context.user_data["debt_update_nom"])
+    sym = "$" if r and r.get("devise") == "USD" else "€"
+    await update.message.reply_text(
+        t("debt_new_montant", lang, sym=sym),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return DEBT_UPDATE_MONTANT
+
+async def dette_update_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    try:
+        montant = float(update.message.text.replace(",",".").replace("€","").replace("$","").strip())
+    except ValueError:
+        await update.message.reply_text(t("invalid_amount", lang))
+        return DEBT_UPDATE_MONTANT
+    nom   = context.user_data["debt_update_nom"]
+    count = debt_update(uid(update), nom, montant)
+    if count:
+        r = debt_get_one(uid(update), nom)
+        await update.message.reply_text(
+            f"{t('debt_updated', lang)}\n\n" + debt_row_summary(r, lang),
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(t("not_found", lang, nom=nom))
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------- #
+# /dette_delete
+# --------------------------------------------------------------------------- #
+async def dette_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    noms = debt_list_names(uid(update))
+    if not noms:
+        await update.message.reply_text(t("debt_none", lang))
+        return ConversationHandler.END
+    keyboard = [[n] for n in noms]
+    await update.message.reply_text(
+        t("debt_delete_which", lang),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DEBT_DELETE_NOM
+
+async def dette_delete_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang  = get_lang(uid(update))
+    nom   = update.message.text.strip()
+    count = debt_delete(uid(update), nom)
+    msg   = t("debt_deleted", lang, nom=nom) if count else t("not_found", lang, nom=nom)
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
