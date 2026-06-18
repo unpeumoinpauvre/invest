@@ -1,25 +1,36 @@
 """
-UPMP – Bot Portefeuille (multi-utilisateurs)
----------------------------------------------
-Chaque utilisateur Telegram a ses propres investissements, isolés par user_id.
-Pas de restriction d'accès — tout le monde peut utiliser le bot.
+UPMP – Bot Gestion de Patrimoine (multi-users, multi-devises, bilingue FR/EN)
+-----------------------------------------------------------------------------
+Fonctionnalités :
+  - Message de bienvenue UPMP + bouton YouTube
+  - Choix de langue FR/EN au démarrage
+  - Investissements en € ou $ avec conversion automatique
+  - Objectif de liberté financière avec barre de progression
+  - Message matinal à 6h00 : % de liberté financière atteint
+  - Rapport quotidien à 20h30 : portefeuille complet
+  - Multi-utilisateurs : chaque user a ses propres données
 
 Commandes :
+  /start      → démarrage + choix de langue
   /add        → ajouter un investissement
-  /update     → mettre à jour la valeur actuelle
+  /update     → mettre à jour une valeur
   /sell       → marquer comme vendu
-  /portfolio  → tableau complet de tous tes investissements
+  /portfolio  → tableau complet
   /chart      → graphique d'une plateforme
   /charts     → graphiques de toutes les plateformes
-  /total      → résumé global
+  /total      → résumé global (€ + $)
+  /objectif   → définir/voir l'objectif de liberté financière
+  /liberte    → barre de progression vers la liberté financière
+  /list       → liste rapide
+  /langue     → changer de langue
   /delete     → supprimer un investissement
-  /list       → liste rapide des noms
 """
 
 import os
 import io
 import logging
 import datetime
+import requests as req
 
 import psycopg2
 import psycopg2.extras
@@ -28,10 +39,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
-    MessageHandler, filters, ContextTypes,
+    MessageHandler, CallbackQueryHandler, filters, ContextTypes,
 )
 
 # --------------------------------------------------------------------------- #
@@ -39,18 +50,364 @@ from telegram.ext import (
 # --------------------------------------------------------------------------- #
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DATABASE_URL       = os.environ["DATABASE_URL"]
+YOUTUBE_URL        = "https://www.youtube.com/@unpeumoinspauvre"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("upmp-portfolio")
 
 # Conversation states
-(ADD_NOM, ADD_TYPE, ADD_DATE, ADD_MISE, ADD_VALEUR, ADD_RENDEMENT,
+(LANG_CHOICE,
+ ADD_NOM, ADD_TYPE, ADD_DEVISE, ADD_DATE, ADD_MISE, ADD_VALEUR, ADD_RENDEMENT,
  UPDATE_NOM, UPDATE_VALEUR,
- SELL_NOM,
- DELETE_NOM) = range(10)
+ SELL_NOM, DELETE_NOM,
+ OBJECTIF_MONTANT) = range(13)
 
 TYPES = ["Crypto", "Crowdlending", "DeFi", "Minage", "Immobilier", "RWA",
          "Pool liquidité", "Vault", "Actions", "Autre"]
+DEVISES = ["EUR (€)", "USD ($)"]
+
+# --------------------------------------------------------------------------- #
+# Traductions FR/EN
+# --------------------------------------------------------------------------- #
+T = {
+    "welcome": {
+        "fr": (
+            "👋 <b>Bienvenue sur le Bot de Gestion de Patrimoine</b>\n\n"
+            "Toutes les données que tu rentres t'appartiennent exclusivement. "
+            "Ce service est proposé gratuitement par <b>Un Peu Moins Pauvre</b> — "
+            "la chaîne YouTube dédiée à l'investissement accessible à tous.\n\n"
+            "📊 Suis tes investissements en € et $\n"
+            "🎯 Définis ton objectif de liberté financière\n"
+            "📈 Reçois un rapport chaque soir à 20h30\n"
+            "☀️ Chaque matin à 6h, vois où tu en es\n\n"
+            "Abonne-toi à la chaîne pour ne rien manquer 👇"
+        ),
+        "en": (
+            "👋 <b>Welcome to the Wealth Management Bot</b>\n\n"
+            "All data you enter belongs exclusively to you. "
+            "This service is offered for free by <b>Un Peu Moins Pauvre</b> — "
+            "the YouTube channel dedicated to accessible investing.\n\n"
+            "📊 Track your investments in € and $\n"
+            "🎯 Set your financial freedom goal\n"
+            "📈 Receive a daily report every evening at 8:30 PM\n"
+            "☀️ Every morning at 6 AM, see where you stand\n\n"
+            "Subscribe to the channel to stay updated 👇"
+        ),
+    },
+    "choose_lang": {
+        "fr": "🌍 Choisis ta langue / Choose your language :",
+        "en": "🌍 Choisis ta langue / Choose your language :",
+    },
+    "lang_set": {
+        "fr": "✅ Langue définie : Français. Utilise /add pour commencer 🚀",
+        "en": "✅ Language set: English. Use /add to get started 🚀",
+    },
+    "no_investments": {
+        "fr": "Aucun investissement. Utilise /add pour commencer.",
+        "en": "No investments yet. Use /add to get started.",
+    },
+    "add_nom": {
+        "fr": "📝 Nom de l'investissement ?",
+        "en": "📝 Name of the investment?",
+    },
+    "add_type": {
+        "fr": "Type d'investissement ?",
+        "en": "Type of investment?",
+    },
+    "add_devise": {
+        "fr": "Devise ?",
+        "en": "Currency?",
+    },
+    "add_date": {
+        "fr": "Date d'entrée ? (JJ/MM/AAAA ou 'aujourd'hui')",
+        "en": "Entry date? (DD/MM/YYYY or 'today')",
+    },
+    "add_date_err": {
+        "fr": "Format invalide. Essaie JJ/MM/AAAA.",
+        "en": "Invalid format. Try DD/MM/YYYY.",
+    },
+    "add_mise": {
+        "fr": "Mise de départ en {sym} ?",
+        "en": "Initial investment in {sym}?",
+    },
+    "add_valeur": {
+        "fr": "Valeur actuelle en {sym} ? (Entrée = même que la mise)",
+        "en": "Current value in {sym}? (Enter = same as initial)",
+    },
+    "add_rendement": {
+        "fr": "Rendement annuel déclaré en % ? (ex: 14.5)\nEntrée pour ignorer.",
+        "en": "Declared annual yield in %? (e.g. 14.5)\nPress Enter to skip.",
+    },
+    "added": {
+        "fr": "✅ Ajouté (ID {id}) !",
+        "en": "✅ Added (ID {id})!",
+    },
+    "updated": {
+        "fr": "✅ Mis à jour !",
+        "en": "✅ Updated!",
+    },
+    "sold": {
+        "fr": "✅ '{nom}' marqué comme vendu.",
+        "en": "✅ '{nom}' marked as sold.",
+    },
+    "not_found": {
+        "fr": "'{nom}' introuvable.",
+        "en": "'{nom}' not found.",
+    },
+    "deleted": {
+        "fr": "🗑️ '{nom}' supprimé.",
+        "en": "🗑️ '{nom}' deleted.",
+    },
+    "cancelled": {
+        "fr": "Annulé.",
+        "en": "Cancelled.",
+    },
+    "update_which": {
+        "fr": "Quel investissement mettre à jour ?",
+        "en": "Which investment to update?",
+    },
+    "sell_which": {
+        "fr": "Quel investissement marquer comme vendu ?",
+        "en": "Which investment to mark as sold?",
+    },
+    "delete_which": {
+        "fr": "⚠️ Quel investissement supprimer définitivement ?",
+        "en": "⚠️ Which investment to permanently delete?",
+    },
+    "new_value": {
+        "fr": "Nouvelle valeur actuelle en {sym} ?",
+        "en": "New current value in {sym}?",
+    },
+    "invalid_amount": {
+        "fr": "Montant invalide.",
+        "en": "Invalid amount.",
+    },
+    "no_active": {
+        "fr": "Aucun investissement actif.",
+        "en": "No active investments.",
+    },
+    "generating": {
+        "fr": "📊 Génération de {n} graphiques…",
+        "en": "📊 Generating {n} charts…",
+    },
+    "chart_usage": {
+        "fr": "Utilise /chart <nom>\nEx : /chart GoMining",
+        "en": "Use /chart <name>\nEx: /chart GoMining",
+    },
+    "list_active": {
+        "fr": "Actifs",
+        "en": "Active",
+    },
+    "list_sold": {
+        "fr": "Vendus",
+        "en": "Sold",
+    },
+    "list_title": {
+        "fr": "📋 <b>Mes investissements</b>",
+        "en": "📋 <b>My investments</b>",
+    },
+    "objectif_ask": {
+        "fr": "🎯 Quel est ton objectif de patrimoine total pour la liberté financière ? (ex: 500000 pour 500 000 €)",
+        "en": "🎯 What is your total wealth goal for financial freedom? (e.g. 500000 for $500,000)",
+    },
+    "objectif_set": {
+        "fr": "✅ Objectif défini : {montant} !\nUtilise /liberte pour voir ta progression.",
+        "en": "✅ Goal set: {montant}!\nUse /liberte to see your progress.",
+    },
+    "objectif_invalid": {
+        "fr": "Montant invalide. Exemple : 500000",
+        "en": "Invalid amount. Example: 500000",
+    },
+    "liberte_title": {
+        "fr": "🎯 <b>Liberté Financière</b>",
+        "en": "🎯 <b>Financial Freedom</b>",
+    },
+    "liberte_no_goal": {
+        "fr": "Tu n'as pas encore défini d'objectif. Utilise /objectif.",
+        "en": "You haven't set a goal yet. Use /objectif.",
+    },
+    "morning_msg": {
+        "fr": (
+            "☀️ <b>Bonjour ! Voici où tu en es aujourd'hui</b>\n\n"
+            "💰 Patrimoine actuel : <b>{valeur} €</b>\n"
+            "🎯 Objectif liberté financière : <b>{objectif} €</b>\n\n"
+            "{barre}\n\n"
+            "📈 Tu es à <b>{pct:.1f}%</b> de ta liberté financière.\n"
+            "⏳ Il te reste <b>{reste} €</b> à accumuler (<b>{pct_restant:.1f}%</b> du chemin).\n\n"
+            "{message}"
+        ),
+        "en": (
+            "☀️ <b>Good morning! Here's where you stand today</b>\n\n"
+            "💰 Current wealth: <b>{valeur} €</b>\n"
+            "🎯 Financial freedom goal: <b>{objectif} €</b>\n\n"
+            "{barre}\n\n"
+            "📈 You're at <b>{pct:.1f}%</b> of financial freedom.\n"
+            "⏳ You still need <b>{reste} €</b> to get there (<b>{pct_restant:.1f}%</b> remaining).\n\n"
+            "{message}"
+        ),
+    },
+    "morning_motivation": {
+        "fr": [
+            "Continue comme ça, chaque euro compte ! 💪",
+            "Tu construis ta liberté jour après jour. 🚀",
+            "Le chemin est long mais tu avances ! 🎯",
+            "Investis régulièrement et la magie des intérêts composés fera le reste. ✨",
+            "Un Peu Moins Pauvre chaque jour ! 😊",
+        ],
+        "en": [
+            "Keep it up, every dollar counts! 💪",
+            "You're building your freedom day by day. 🚀",
+            "The road is long but you're making progress! 🎯",
+            "Invest regularly and compound interest will do the rest. ✨",
+            "A little less broke every day! 😊",
+        ],
+    },
+    "daily_report_header": {
+        "fr": "🌅 <b>Rapport du {date}</b>",
+        "en": "🌅 <b>Daily report — {date}</b>",
+    },
+    "total_title": {
+        "fr": "📊 <b>Résumé global</b>",
+        "en": "📊 <b>Global summary</b>",
+    },
+    "rate_label": {
+        "fr": "taux EUR/USD",
+        "en": "EUR/USD rate",
+    },
+    "total_invested": {
+        "fr": "💰 Total investi",
+        "en": "💰 Total invested",
+    },
+    "current_value": {
+        "fr": "📈 Valeur actuelle",
+        "en": "📈 Current value",
+    },
+    "real_gain": {
+        "fr": "Gain réel",
+        "en": "Real gain",
+    },
+    "annualized": {
+        "fr": "📅 Rendement annualisé moyen pondéré",
+        "en": "📅 Weighted avg annualized return",
+    },
+    "annual_proj": {
+        "fr": "🎯 Projection annuelle",
+        "en": "🎯 Annual projection",
+    },
+    "monthly_proj": {
+        "fr": "📅 Soit",
+        "en": "📅 That is",
+    },
+    "per_month": {
+        "fr": "€/mois",
+        "en": "€/month",
+    },
+    "active_positions": {
+        "fr": "📦 Positions actives",
+        "en": "📦 Active positions",
+    },
+    "row_invested": {
+        "fr": "💰 Investi le",
+        "en": "💰 Invested on",
+    },
+    "row_current": {
+        "fr": "📊 Valeur actuelle",
+        "en": "📊 Current value",
+    },
+    "row_gain": {
+        "fr": "Gain réel",
+        "en": "Real gain",
+    },
+    "row_annualized": {
+        "fr": "📅 Rendement annualisé réel",
+        "en": "📅 Real annualized return",
+    },
+    "row_proj": {
+        "fr": "🎯 Projection annuelle",
+        "en": "🎯 Annual projection",
+    },
+    "row_declared": {
+        "fr": "ℹ️  Rendement déclaré",
+        "en": "ℹ️  Declared yield",
+    },
+    "row_sold_on": {
+        "fr": "📅 Vendu le",
+        "en": "📅 Sold on",
+    },
+    "vendu": {
+        "fr": "VENDU",
+        "en": "SOLD",
+    },
+    "commands": {
+        "fr": (
+            "/add — Ajouter un investissement\n"
+            "/update — Mettre à jour une valeur\n"
+            "/sell — Marquer comme vendu\n"
+            "/portfolio — Voir tout le portefeuille\n"
+            "/chart — Graphique d'une plateforme\n"
+            "/charts — Graphiques de toutes les plateformes\n"
+            "/total — Résumé global (€ + $)\n"
+            "/objectif — Définir ton objectif de liberté financière\n"
+            "/liberte — Voir ta barre de progression\n"
+            "/list — Liste des investissements\n"
+            "/langue — Changer de langue\n"
+            "/delete — Supprimer un investissement"
+        ),
+        "en": (
+            "/add — Add an investment\n"
+            "/update — Update a value\n"
+            "/sell — Mark as sold\n"
+            "/portfolio — View full portfolio\n"
+            "/chart — Chart for one platform\n"
+            "/charts — Charts for all platforms\n"
+            "/total — Global summary (€ + $)\n"
+            "/objectif — Set your financial freedom goal\n"
+            "/liberte — View your progress bar\n"
+            "/list — List investments\n"
+            "/langue — Change language\n"
+            "/delete — Delete an investment"
+        ),
+    },
+}
+
+def t(key, lang, **kwargs):
+    """Récupère une traduction et formate avec kwargs."""
+    val = T.get(key, {}).get(lang, T.get(key, {}).get("fr", key))
+    if kwargs:
+        try:
+            val = val.format(**kwargs)
+        except Exception:
+            pass
+    return val
+
+
+# --------------------------------------------------------------------------- #
+# Taux de change
+# --------------------------------------------------------------------------- #
+_rate_cache = {"rate": None, "ts": None}
+
+def get_eur_usd():
+    now = datetime.datetime.utcnow()
+    if _rate_cache["rate"] and _rate_cache["ts"] and \
+            (now - _rate_cache["ts"]).seconds < 3600:
+        return _rate_cache["rate"]
+    try:
+        r = req.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=10)
+        rate = r.json()["rates"]["USD"]
+        _rate_cache["rate"] = rate
+        _rate_cache["ts"]   = now
+        return rate
+    except Exception as exc:
+        log.warning("Taux EUR/USD indisponible : %s", exc)
+        return _rate_cache["rate"] or 1.08
+
+
+def to_eur(montant, devise):
+    return montant / get_eur_usd() if devise == "USD" else montant
+
+def to_usd(montant, devise):
+    return montant * get_eur_usd() if devise == "EUR" else montant
+
 
 # --------------------------------------------------------------------------- #
 # DB
@@ -68,6 +425,7 @@ def init_db():
                     user_id     BIGINT NOT NULL,
                     nom         TEXT NOT NULL,
                     type        TEXT,
+                    devise      TEXT DEFAULT 'EUR',
                     date_entree DATE,
                     mise        NUMERIC(12,2) NOT NULL,
                     valeur      NUMERIC(12,2),
@@ -78,22 +436,79 @@ def init_db():
                     updated_at  TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # Index pour accélérer les requêtes par user
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_investments_user_id
-                ON investments(user_id)
+                CREATE INDEX IF NOT EXISTS idx_inv_user ON investments(user_id)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id    BIGINT PRIMARY KEY,
+                    chat_id    BIGINT NOT NULL,
+                    langue     TEXT DEFAULT 'fr',
+                    objectif   NUMERIC(14,2),
+                    active     BOOLEAN DEFAULT TRUE,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
             """)
         conn.commit()
     log.info("DB initialisée.")
 
 
-def db_add(user_id, nom, type_, date_entree, mise, valeur, rendement):
+def upsert_user(user_id, chat_id, langue=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if langue:
+                cur.execute("""
+                    INSERT INTO users (user_id, chat_id, langue, active)
+                    VALUES (%s, %s, %s, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE
+                      SET chat_id=%s, langue=%s, active=TRUE, updated_at=NOW()
+                """, (user_id, chat_id, langue, chat_id, langue))
+            else:
+                cur.execute("""
+                    INSERT INTO users (user_id, chat_id, active)
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE
+                      SET chat_id=%s, active=TRUE, updated_at=NOW()
+                """, (user_id, chat_id, chat_id))
+        conn.commit()
+
+
+def get_user(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE user_id=%s", (user_id,))
+            return cur.fetchone()
+
+
+def get_lang(user_id):
+    u = get_user(user_id)
+    return u["langue"] if u and u["langue"] else "fr"
+
+
+def set_objectif(user_id, montant):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO investments (user_id, nom, type, date_entree, mise, valeur, rendement)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-            """, (user_id, nom, type_, date_entree, mise, valeur, rendement))
+                UPDATE users SET objectif=%s, updated_at=NOW() WHERE user_id=%s
+            """, (montant, user_id))
+        conn.commit()
+
+
+def get_all_users():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE active=TRUE")
+            return cur.fetchall()
+
+
+def db_add(user_id, nom, type_, devise, date_entree, mise, valeur, rendement):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO investments
+                  (user_id, nom, type, devise, date_entree, mise, valeur, rendement)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (user_id, nom, type_, devise, date_entree, mise, valeur, rendement))
             row = cur.fetchone()
         conn.commit()
     return row["id"]
@@ -164,95 +579,131 @@ def db_get_one(user_id, nom):
 def db_list_names(user_id, include_sold=False):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            if include_sold:
-                cur.execute(
-                    "SELECT nom FROM investments WHERE user_id=%s ORDER BY nom",
-                    (user_id,)
-                )
-            else:
-                cur.execute(
-                    "SELECT nom FROM investments WHERE user_id=%s AND vendu=FALSE ORDER BY nom",
-                    (user_id,)
-                )
+            q = "SELECT nom FROM investments WHERE user_id=%s"
+            if not include_sold:
+                q += " AND vendu=FALSE"
+            q += " ORDER BY nom"
+            cur.execute(q, (user_id,))
             return [r["nom"] for r in cur.fetchall()]
 
 
 # --------------------------------------------------------------------------- #
 # Calculs
 # --------------------------------------------------------------------------- #
-def calc_rendement_annualise(mise, valeur, date_entree):
+def calc_annualise(mise, valeur, date_entree):
     if not mise or not valeur or not date_entree:
         return None
     jours = (datetime.date.today() - date_entree).days
     if jours <= 0:
         return None
-    gain = float(valeur) - float(mise)
-    return (gain / float(mise)) / (jours / 365) * 100
+    return (float(valeur) - float(mise)) / float(mise) / (jours / 365) * 100
 
 
-def format_eur(v):
-    if v is None:
-        return "—"
-    sign = "+" if v > 0 else ""
-    return f"{sign}{v:,.2f} €"
+def make_progress_bar(pct, length=20):
+    """Génère une barre de progression texte."""
+    pct     = min(pct, 100)
+    filled  = int(length * pct / 100)
+    empty   = length - filled
+    return f"[{'█' * filled}{'░' * empty}] {pct:.1f}%"
 
 
-def row_summary(r):
-    mise   = float(r["mise"])   if r["mise"]   else 0
-    valeur = float(r["valeur"]) if r["valeur"] else mise
-    gain   = valeur - mise
-    pct    = (gain / mise * 100) if mise else 0
-
-    annualise  = calc_rendement_annualise(mise, valeur, r["date_entree"])
-    projection = (mise * annualise / 100) if annualise is not None else None
-
-    statut   = "⚪ VENDU" if r["vendu"] else "🔵"
-    date_str = r["date_entree"].strftime("%d/%m/%Y") if r["date_entree"] else "—"
-    emoji    = "🟢" if gain >= 0 else "🔴"
+def row_summary(r, lang="fr"):
+    rate    = get_eur_usd()
+    devise  = r.get("devise") or "EUR"
+    mise_n  = float(r["mise"])   if r["mise"]   else 0
+    val_n   = float(r["valeur"]) if r["valeur"] else mise_n
+    mise_e  = to_eur(mise_n, devise)
+    val_e   = to_eur(val_n,  devise)
+    gain_e  = val_e - mise_e
+    pct     = (gain_e / mise_e * 100) if mise_e else 0
+    ann     = calc_annualise(mise_n, val_n, r["date_entree"])
+    proj_e  = (mise_e * ann / 100) if ann else None
+    sym     = "$" if devise == "USD" else "€"
+    eg      = "🟢" if gain_e >= 0 else "🔴"
+    es      = f"⚪ {t('vendu', lang)}" if r["vendu"] else "🔵"
+    ds      = r["date_entree"].strftime("%d/%m/%Y") if r["date_entree"] else "—"
 
     lines = [
-        f"{statut} <b>{r['nom']}</b> [{r['type'] or '—'}]",
-        f"  💰 Investi le {date_str} : {mise:,.2f} €",
-        f"  📊 Valeur actuelle : {valeur:,.2f} €",
-        f"  {emoji} Gain réel : {format_eur(gain)} ({pct:+.2f}%)",
+        f"{es} <b>{r['nom']}</b> [{r['type'] or '—'}] — {devise}",
+        f"  {t('row_invested', lang)} {ds} : {mise_n:,.2f} {sym}  ({mise_e:,.2f} € / {mise_e*rate:,.2f} $)",
+        f"  {t('row_current',  lang)}    : {val_n:,.2f} {sym}  ({val_e:,.2f} € / {val_e*rate:,.2f} $)",
+        f"  {eg} {t('row_gain', lang)} : {gain_e:+,.2f} € ({pct:+.2f}%)",
     ]
-    if annualise is not None:
-        lines.append(f"  📅 Rendement annualisé réel : {annualise:+.1f}%/an")
-    if projection is not None:
-        lines.append(f"  🎯 Projection annuelle : {format_eur(projection)}")
-    if r["rendement"]:
-        lines.append(f"  ℹ️  Rendement déclaré : {float(r['rendement']):.1f}%/an")
-    if r["vendu"] and r["date_vente"]:
-        lines.append(f"  📅 Vendu le : {r['date_vente'].strftime('%d/%m/%Y')}")
+    if ann is not None:
+        lines.append(f"  {t('row_annualized', lang)} : {ann:+.1f}%/an")
+    if proj_e is not None:
+        lines.append(f"  {t('row_proj', lang)} : {proj_e:+,.2f} €/an")
+    if r.get("rendement"):
+        lines.append(f"  {t('row_declared', lang)} : {float(r['rendement']):.1f}%/an")
+    if r["vendu"] and r.get("date_vente"):
+        lines.append(f"  {t('row_sold_on', lang)} : {r['date_vente'].strftime('%d/%m/%Y')}")
     return "\n".join(lines)
+
+
+def total_summary(rows, lang="fr"):
+    rate = get_eur_usd()
+    total_mise_e = total_val_e = 0
+    poids = []
+    for r in rows:
+        dev    = r.get("devise") or "EUR"
+        mise_n = float(r["mise"])   if r["mise"]   else 0
+        val_n  = float(r["valeur"]) if r["valeur"] else mise_n
+        mise_e = to_eur(mise_n, dev)
+        val_e  = to_eur(val_n,  dev)
+        total_mise_e += mise_e
+        total_val_e  += val_e
+        ann = calc_annualise(mise_n, val_n, r["date_entree"])
+        if ann is not None:
+            poids.append((mise_e, ann))
+
+    gain_e = total_val_e - total_mise_e
+    pct    = (gain_e / total_mise_e * 100) if total_mise_e else 0
+    eg     = "🟢" if gain_e >= 0 else "🔴"
+
+    if poids:
+        tp     = sum(m for m, _ in poids)
+        ann_p  = sum(m * a for m, a in poids) / tp
+        proj_e = total_mise_e * ann_p / 100
+    else:
+        ann_p = proj_e = None
+
+    msg = (
+        f"{t('total_title', lang)} — {t('rate_label', lang)} : {rate:.4f}\n\n"
+        f"{t('total_invested', lang)} : <b>{total_mise_e:,.2f} €  ({total_mise_e*rate:,.2f} $)</b>\n"
+        f"{t('current_value',  lang)} : <b>{total_val_e:,.2f} €  ({total_val_e*rate:,.2f} $)</b>\n"
+        f"{eg} {t('real_gain', lang)} : <b>{gain_e:+,.2f} €  ({gain_e*rate:+,.2f} $)  ({pct:+.2f}%)</b>\n"
+    )
+    if ann_p is not None:
+        msg += f"\n{t('annualized', lang)} : <b>{ann_p:+.1f}%/an</b>"
+    if proj_e is not None:
+        msg += f"\n{t('annual_proj', lang)} : <b>{proj_e:+,.2f} €/an  ({proj_e*rate:+,.2f} $/an)</b>"
+        msg += f"\n{t('monthly_proj', lang)} : <b>{proj_e/12:+,.2f} €/mois  ({proj_e*rate/12:+,.2f} $/mois)</b>"
+    msg += f"\n\n{t('active_positions', lang)} : {len(rows)}"
+    return msg
 
 
 # --------------------------------------------------------------------------- #
 # Graphique
 # --------------------------------------------------------------------------- #
-def make_chart(nom, mise, valeur, date_entree, annualise):
+def make_chart(nom, mise_eur, val_eur, date_entree, ann):
     fig, ax = plt.subplots(figsize=(8, 4))
     fig.patch.set_facecolor("#f3f8fc")
     ax.set_facecolor("#f3f8fc")
-
     today = datetime.date.today()
+    d0    = date_entree or today
 
-    # Courbe réelle
-    d0 = date_entree or today
-    ax.plot([d0, today], [float(mise), float(valeur)],
-            color="#4996cc", linewidth=2.5, marker="o", markersize=6, label="Valeur réelle")
+    ax.plot([d0, today], [mise_eur, val_eur],
+            color="#4996cc", linewidth=2.5, marker="o", markersize=6, label="Valeur réelle (€)")
 
-    # Courbe projetée sur 1 an
-    if annualise is not None and date_entree:
+    if ann is not None and date_entree:
         d1 = date_entree + datetime.timedelta(days=365)
         ax.plot([date_entree, d1],
-                [float(mise), float(mise) * (1 + annualise / 100)],
+                [mise_eur, mise_eur * (1 + ann / 100)],
                 color="#fddd07", linewidth=1.5, linestyle="--",
-                label=f"Projection ({annualise:+.1f}%/an)")
+                label=f"Projection ({ann:+.1f}%/an)")
 
-    # Ligne mise de départ
-    ax.axhline(float(mise), color="#e30021", linewidth=1, linestyle=":",
-               label=f"Mise : {float(mise):,.0f} €")
+    ax.axhline(mise_eur, color="#e30021", linewidth=1, linestyle=":",
+               label=f"Mise : {mise_eur:,.0f} €")
 
     ax.set_title(nom, fontsize=14, fontweight="bold", color="#010101")
     ax.set_ylabel("Valeur (€)", color="#5b6b78")
@@ -272,128 +723,251 @@ def make_chart(nom, mise, valeur, date_entree, annualise):
     return buf
 
 
-def uid(update):
-    return update.effective_user.id
+def uid(update): return update.effective_user.id
+def cid(update): return update.effective_chat.id
 
 
 # --------------------------------------------------------------------------- #
-# Commandes simples
+# Jobs quotidiens
+# --------------------------------------------------------------------------- #
+async def morning_job(context):
+    """6h00 : message de liberté financière."""
+    import random
+    users = get_all_users()
+    for u in users:
+        user_id = u["user_id"]
+        chat_id = u["chat_id"]
+        lang    = u["langue"] or "fr"
+        objectif = float(u["objectif"]) if u.get("objectif") else None
+        rows     = db_get_all(user_id, include_sold=False)
+        if not rows:
+            continue
+        total_val_e = sum(to_eur(float(r["valeur"] or r["mise"]), r.get("devise") or "EUR")
+                          for r in rows)
+        if not objectif:
+            continue
+        pct          = min(total_val_e / objectif * 100, 100)
+        reste        = max(objectif - total_val_e, 0)
+        pct_restant  = max(100 - pct, 0)
+        barre        = make_progress_bar(pct)
+        motiv        = random.choice(T["morning_motivation"][lang])
+        try:
+            msg = t("morning_msg", lang,
+                    valeur=f"{total_val_e:,.2f}",
+                    objectif=f"{objectif:,.2f}",
+                    barre=barre, pct=pct,
+                    reste=f"{reste:,.2f}",
+                    pct_restant=pct_restant,
+                    message=motiv)
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+        except Exception as exc:
+            log.error("Morning job user %s : %s", user_id, exc)
+
+
+async def daily_report_job(context):
+    """20h30 : rapport complet du portefeuille."""
+    users = get_all_users()
+    for u in users:
+        user_id = u["user_id"]
+        chat_id = u["chat_id"]
+        lang    = u["langue"] or "fr"
+        rows    = db_get_all(user_id, include_sold=False)
+        if not rows:
+            continue
+        try:
+            date_str = datetime.datetime.now().strftime("%d/%m/%Y")
+            header   = t("daily_report_header", lang, date=date_str)
+            msg      = f"{header}\n\n" + total_summary(rows, lang)
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+        except Exception as exc:
+            log.error("Daily report user %s : %s", user_id, exc)
+
+
+# --------------------------------------------------------------------------- #
+# /start → choix de langue
 # --------------------------------------------------------------------------- #
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(uid(update), cid(update))
+    keyboard = [["🇫🇷 Français", "🇬🇧 English"]]
     await update.message.reply_text(
-        "👋 <b>Bot Portefeuille</b>\n\n"
-        "Suis tes investissements simplement. Chaque utilisateur a ses propres données.\n\n"
-        "/add — Ajouter un investissement\n"
-        "/update — Mettre à jour une valeur\n"
-        "/sell — Marquer comme vendu\n"
-        "/portfolio — Voir tout le portefeuille\n"
-        "/chart — Graphique d'une plateforme\n"
-        "/charts — Graphiques de toutes les plateformes\n"
-        "/total — Résumé global\n"
-        "/list — Liste des investissements\n"
-        "/delete — Supprimer un investissement\n\n"
-        "Commence par /add 🚀",
+        t("choose_lang", "fr"),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return LANG_CHOICE
+
+
+async def lang_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt  = update.message.text.strip()
+    lang = "en" if "English" in txt or "EN" in txt else "fr"
+    upsert_user(uid(update), cid(update), langue=lang)
+
+    # Message de bienvenue avec bouton YouTube
+    btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)
+    ]])
+    await update.message.reply_text(
+        t("welcome", lang),
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        t("commands", lang),
+        parse_mode="HTML",
+        reply_markup=btn,
+    )
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------- #
+# /langue — changer de langue
+# --------------------------------------------------------------------------- #
+async def cmd_langue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["🇫🇷 Français", "🇬🇧 English"]]
+    await update.message.reply_text(
+        t("choose_lang", "fr"),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return LANG_CHOICE
+
+
+# --------------------------------------------------------------------------- #
+# /objectif
+# --------------------------------------------------------------------------- #
+async def cmd_objectif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    u    = get_user(uid(update))
+    if u and u.get("objectif"):
+        pct   = 0
+        rows  = db_get_all(uid(update), include_sold=False)
+        total = sum(to_eur(float(r["valeur"] or r["mise"]), r.get("devise") or "EUR") for r in rows)
+        pct   = min(total / float(u["objectif"]) * 100, 100)
+        barre = make_progress_bar(pct)
+        await update.message.reply_text(
+            f"{t('liberte_title', lang)}\n\n"
+            f"🎯 Objectif : <b>{float(u['objectif']):,.2f} €</b>\n"
+            f"💰 Actuel   : <b>{total:,.2f} €</b>\n"
+            f"{barre}\n\n"
+            f"Veux-tu modifier l'objectif ? Envoie le nouveau montant :",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(t("objectif_ask", lang))
+    return OBJECTIF_MONTANT
+
+
+async def objectif_montant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    try:
+        montant = float(update.message.text.replace(" ", "").replace(",", ".").replace("€","").replace("$",""))
+    except ValueError:
+        await update.message.reply_text(t("objectif_invalid", lang))
+        return OBJECTIF_MONTANT
+    set_objectif(uid(update), montant)
+    await update.message.reply_text(
+        t("objectif_set", lang, montant=f"{montant:,.2f} €")
+    )
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------- #
+# /liberte
+# --------------------------------------------------------------------------- #
+async def cmd_liberte(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    u    = get_user(uid(update))
+    if not u or not u.get("objectif"):
+        await update.message.reply_text(t("liberte_no_goal", lang))
+        return
+    rows     = db_get_all(uid(update), include_sold=False)
+    total    = sum(to_eur(float(r["valeur"] or r["mise"]), r.get("devise") or "EUR") for r in rows)
+    objectif = float(u["objectif"])
+    pct      = min(total / objectif * 100, 100)
+    barre    = make_progress_bar(pct)
+    await update.message.reply_text(
+        f"{t('liberte_title', lang)}\n\n"
+        f"💰 Patrimoine actuel : <b>{total:,.2f} €</b>\n"
+        f"🎯 Objectif          : <b>{objectif:,.2f} €</b>\n\n"
+        f"{barre}\n\n"
+        f"📈 Tu es à <b>{pct:.1f}%</b> de ta liberté financière !",
         parse_mode="HTML",
     )
 
 
+# --------------------------------------------------------------------------- #
+# /list, /portfolio, /total, /chart, /charts
+# --------------------------------------------------------------------------- #
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     rows = db_get_all(uid(update))
     if not rows:
-        await update.message.reply_text("Aucun investissement. Utilise /add pour commencer.")
+        await update.message.reply_text(t("no_investments", lang))
         return
-    actifs = [r["nom"] for r in rows if not r["vendu"]]
-    vendus = [r["nom"] for r in rows if r["vendu"]]
-    msg = "📋 <b>Mes investissements</b>\n\n"
+    actifs = [f"• {r['nom']} ({r.get('devise','EUR')})" for r in rows if not r["vendu"]]
+    vendus = [f"⚪ {r['nom']}" for r in rows if r["vendu"]]
+    msg = f"{t('list_title', lang)}\n\n"
     if actifs:
-        msg += "<b>Actifs :</b>\n" + "\n".join(f"• {n}" for n in actifs)
+        msg += f"<b>{t('list_active', lang)} :</b>\n" + "\n".join(actifs)
     if vendus:
-        msg += "\n\n<b>Vendus :</b>\n" + "\n".join(f"⚪ {n}" for n in vendus)
+        msg += f"\n\n<b>{t('list_sold', lang)} :</b>\n" + "\n".join(vendus)
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     rows = db_get_all(uid(update))
     if not rows:
-        await update.message.reply_text("Aucun investissement. Utilise /add pour commencer.")
+        await update.message.reply_text(t("no_investments", lang))
         return
     for r in rows:
-        await update.message.reply_text(row_summary(r), parse_mode="HTML")
+        await update.message.reply_text(row_summary(r, lang), parse_mode="HTML")
 
 
 async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     rows = db_get_all(uid(update), include_sold=False)
     if not rows:
-        await update.message.reply_text("Aucun investissement actif.")
+        await update.message.reply_text(t("no_active", lang))
         return
-
-    total_mise   = sum(float(r["mise"])   for r in rows)
-    total_valeur = sum(float(r["valeur"]) for r in rows if r["valeur"])
-    gain_total   = total_valeur - total_mise
-    pct_total    = (gain_total / total_mise * 100) if total_mise else 0
-
-    # Rendement annualisé moyen pondéré
-    poids = [(float(r["mise"]), calc_rendement_annualise(r["mise"], r["valeur"], r["date_entree"]))
-             for r in rows]
-    poids = [(m, a) for m, a in poids if a is not None]
-    if poids:
-        total_poids = sum(m for m, _ in poids)
-        ann_pondere = sum(m * a for m, a in poids) / total_poids
-        projection  = total_mise * ann_pondere / 100
-    else:
-        ann_pondere = None
-        projection  = None
-
-    emoji = "🟢" if gain_total >= 0 else "🔴"
-    msg = (
-        "📊 <b>Résumé global</b>\n\n"
-        f"💰 Total investi : <b>{total_mise:,.2f} €</b>\n"
-        f"📈 Valeur actuelle : <b>{total_valeur:,.2f} €</b>\n"
-        f"{emoji} Gain réel : <b>{gain_total:+,.2f} €</b> ({pct_total:+.2f}%)\n"
-    )
-    if ann_pondere is not None:
-        msg += f"\n📅 Rendement annualisé moyen pondéré : <b>{ann_pondere:+.1f}%/an</b>"
-    if projection is not None:
-        msg += f"\n🎯 Projection annuelle : <b>{projection:+,.2f} €/an</b>"
-        msg += f"\n📅 Soit : <b>{projection/12:+,.2f} €/mois</b>"
-    msg += f"\n\n📦 Positions actives : {len(rows)}"
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text(total_summary(rows, lang), parse_mode="HTML")
 
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     if context.args:
         nom = " ".join(context.args)
         r   = db_get_one(uid(update), nom)
         if not r:
-            await update.message.reply_text(f"'{nom}' introuvable.")
+            await update.message.reply_text(t("not_found", lang, nom=nom))
             return
-        mise   = float(r["mise"])   if r["mise"]   else 0
-        valeur = float(r["valeur"]) if r["valeur"] else mise
-        ann    = calc_rendement_annualise(mise, valeur, r["date_entree"])
-        buf    = make_chart(r["nom"], mise, valeur, r["date_entree"], ann)
+        dev  = r.get("devise") or "EUR"
+        me   = to_eur(float(r["mise"]),   dev)
+        ve   = to_eur(float(r["valeur"]), dev)
+        ann  = calc_annualise(float(r["mise"]), float(r["valeur"]), r["date_entree"])
+        buf  = make_chart(r["nom"], me, ve, r["date_entree"], ann)
         await update.message.reply_photo(photo=buf, caption=f"📈 {r['nom']}")
     else:
         noms = db_list_names(uid(update))
         if not noms:
-            await update.message.reply_text("Aucun investissement actif.")
+            await update.message.reply_text(t("no_active", lang))
             return
         await update.message.reply_text(
-            "Utilise /chart <nom>\nEx : /chart GoMining\n\n"
-            + "\n".join(f"• {n}" for n in noms)
+            t("chart_usage", lang) + "\n\n" + "\n".join(f"• {n}" for n in noms)
         )
 
 
 async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     rows = db_get_all(uid(update), include_sold=False)
     if not rows:
-        await update.message.reply_text("Aucun investissement actif.")
+        await update.message.reply_text(t("no_active", lang))
         return
-    await update.message.reply_text(f"📊 Génération de {len(rows)} graphiques…")
+    await update.message.reply_text(t("generating", lang, n=len(rows)))
     for r in rows:
-        mise   = float(r["mise"])   if r["mise"]   else 0
-        valeur = float(r["valeur"]) if r["valeur"] else mise
-        ann    = calc_rendement_annualise(mise, valeur, r["date_entree"])
-        buf    = make_chart(r["nom"], mise, valeur, r["date_entree"], ann)
+        dev = r.get("devise") or "EUR"
+        me  = to_eur(float(r["mise"]),   dev)
+        ve  = to_eur(float(r["valeur"]), dev)
+        ann = calc_annualise(float(r["mise"]), float(r["valeur"]), r["date_entree"])
+        buf = make_chart(r["nom"], me, ve, r["date_entree"], ann)
         await update.message.reply_photo(photo=buf, caption=f"📈 {r['nom']}")
 
 
@@ -401,90 +975,100 @@ async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /add
 # --------------------------------------------------------------------------- #
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📝 Nom de l'investissement ?",
-                                    reply_markup=ReplyKeyboardRemove())
+    lang = get_lang(uid(update))
+    upsert_user(uid(update), cid(update))
+    await update.message.reply_text(t("add_nom", lang), reply_markup=ReplyKeyboardRemove())
     return ADD_NOM
 
 async def add_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     context.user_data["nom"] = update.message.text.strip()
-    keyboard = [[t] for t in TYPES]
+    keyboard = [[ty] for ty in TYPES]
     await update.message.reply_text(
-        "Type ?",
+        t("add_type", lang),
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
     return ADD_TYPE
 
 async def add_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     context.user_data["type"] = update.message.text.strip()
+    keyboard = [["EUR (€)", "USD ($)"]]
     await update.message.reply_text(
-        "Date d'entrée ? (JJ/MM/AAAA ou 'aujourd'hui')",
-        reply_markup=ReplyKeyboardRemove(),
+        t("add_devise", lang),
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
+    return ADD_DEVISE
+
+async def add_devise(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip()
+    context.user_data["devise"] = "USD" if "USD" in txt or "$" in txt else "EUR"
+    await update.message.reply_text(t("add_date", lang), reply_markup=ReplyKeyboardRemove())
     return ADD_DATE
 
 async def add_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip().lower()
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip().lower()
     if txt in ("aujourd'hui", "today", "auj"):
         context.user_data["date"] = datetime.date.today()
     else:
         try:
             context.user_data["date"] = datetime.datetime.strptime(txt, "%d/%m/%Y").date()
         except ValueError:
-            await update.message.reply_text("Format invalide. Essaie JJ/MM/AAAA.")
+            await update.message.reply_text(t("add_date_err", lang))
             return ADD_DATE
-    await update.message.reply_text("Mise de départ en € ? (ex: 1000)")
+    sym = "$" if context.user_data["devise"] == "USD" else "€"
+    await update.message.reply_text(t("add_mise", lang, sym=sym))
     return ADD_MISE
 
 async def add_mise(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     try:
         context.user_data["mise"] = float(
-            update.message.text.replace(",", ".").replace("€", "").strip()
+            update.message.text.replace(",", ".").replace("€", "").replace("$", "").strip()
         )
     except ValueError:
-        await update.message.reply_text("Montant invalide.")
+        await update.message.reply_text(t("invalid_amount", lang))
         return ADD_MISE
-    await update.message.reply_text(
-        "Valeur actuelle en € ? (Entrée = même que la mise si pas encore changé)"
-    )
+    sym = "$" if context.user_data["devise"] == "USD" else "€"
+    await update.message.reply_text(t("add_valeur", lang, sym=sym))
     return ADD_VALEUR
 
 async def add_valeur(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip()
     if txt == "":
         context.user_data["valeur"] = context.user_data["mise"]
     else:
         try:
             context.user_data["valeur"] = float(
-                txt.replace(",", ".").replace("€", "").strip()
+                txt.replace(",", ".").replace("€", "").replace("$", "").strip()
             )
         except ValueError:
-            await update.message.reply_text("Montant invalide.")
+            await update.message.reply_text(t("invalid_amount", lang))
             return ADD_VALEUR
-    await update.message.reply_text(
-        "Rendement annuel déclaré en % ? (ex: 14.5 pour MacLear)\n"
-        "Entrée pour ignorer."
-    )
+    await update.message.reply_text(t("add_rendement", lang))
     return ADD_RENDEMENT
 
 async def add_rendement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if txt == "":
-        context.user_data["rendement"] = None
-    else:
+    lang = get_lang(uid(update))
+    txt  = update.message.text.strip()
+    context.user_data["rendement"] = None
+    if txt:
         try:
             context.user_data["rendement"] = float(
                 txt.replace(",", ".").replace("%", "").strip()
             )
         except ValueError:
-            await update.message.reply_text("Valeur invalide.")
+            await update.message.reply_text(t("invalid_amount", lang))
             return ADD_RENDEMENT
-
     d   = context.user_data
-    iid = db_add(uid(update), d["nom"], d["type"], d["date"],
-                 d["mise"], d["valeur"], d["rendement"])
+    iid = db_add(uid(update), d["nom"], d["type"], d["devise"],
+                 d["date"], d["mise"], d["valeur"], d["rendement"])
     r   = db_get_one(uid(update), d["nom"])
     await update.message.reply_text(
-        f"✅ Ajouté (ID {iid}) !\n\n" + row_summary(r),
+        f"{t('added', lang, id=iid)}\n\n" + row_summary(r, lang),
         parse_mode="HTML",
     )
     return ConversationHandler.END
@@ -494,39 +1078,47 @@ async def add_rendement(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /update
 # --------------------------------------------------------------------------- #
 async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     noms = db_list_names(uid(update))
     if not noms:
-        await update.message.reply_text("Aucun investissement actif.")
+        await update.message.reply_text(t("no_active", lang))
         return ConversationHandler.END
     keyboard = [[n] for n in noms]
     await update.message.reply_text(
-        "Quel investissement mettre à jour ?",
+        t("update_which", lang),
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
     return UPDATE_NOM
 
 async def update_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     context.user_data["update_nom"] = update.message.text.strip()
+    r   = db_get_one(uid(update), context.user_data["update_nom"])
+    sym = "$" if r and r.get("devise") == "USD" else "€"
     await update.message.reply_text(
-        "Nouvelle valeur actuelle en € ?",
+        t("new_value", lang, sym=sym),
         reply_markup=ReplyKeyboardRemove(),
     )
     return UPDATE_VALEUR
 
 async def update_valeur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     try:
-        valeur = float(update.message.text.replace(",", ".").replace("€", "").strip())
+        valeur = float(
+            update.message.text.replace(",", ".").replace("€", "").replace("$", "").strip()
+        )
     except ValueError:
-        await update.message.reply_text("Montant invalide.")
+        await update.message.reply_text(t("invalid_amount", lang))
         return UPDATE_VALEUR
     nom   = context.user_data["update_nom"]
     count = db_update(uid(update), nom, valeur)
     if count:
         r = db_get_one(uid(update), nom)
-        await update.message.reply_text("✅ Mis à jour !\n\n" + row_summary(r),
-                                        parse_mode="HTML")
+        await update.message.reply_text(
+            f"{t('updated', lang)}\n\n" + row_summary(r, lang), parse_mode="HTML"
+        )
     else:
-        await update.message.reply_text(f"'{nom}' introuvable.")
+        await update.message.reply_text(t("not_found", lang, nom=nom))
     return ConversationHandler.END
 
 
@@ -534,23 +1126,24 @@ async def update_valeur(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /sell
 # --------------------------------------------------------------------------- #
 async def sell_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     noms = db_list_names(uid(update))
     if not noms:
-        await update.message.reply_text("Aucun investissement actif.")
+        await update.message.reply_text(t("no_active", lang))
         return ConversationHandler.END
     keyboard = [[n] for n in noms]
     await update.message.reply_text(
-        "Quel investissement marquer comme vendu ?",
+        t("sell_which", lang),
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
     return SELL_NOM
 
 async def sell_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang  = get_lang(uid(update))
     nom   = update.message.text.strip()
     count = db_sell(uid(update), nom)
-    emoji = "✅" if count else "❌"
-    msg   = f"'{nom}' marqué comme vendu." if count else f"'{nom}' introuvable ou déjà vendu."
-    await update.message.reply_text(f"{emoji} {msg}", reply_markup=ReplyKeyboardRemove())
+    msg   = t("sold", lang, nom=nom) if count else t("not_found", lang, nom=nom)
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -558,28 +1151,30 @@ async def sell_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /delete
 # --------------------------------------------------------------------------- #
 async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
     noms = db_list_names(uid(update), include_sold=True)
     if not noms:
-        await update.message.reply_text("Aucun investissement.")
+        await update.message.reply_text(t("no_active", lang))
         return ConversationHandler.END
     keyboard = [[n] for n in noms]
     await update.message.reply_text(
-        "⚠️ Quel investissement supprimer définitivement ?",
+        t("delete_which", lang),
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
     return DELETE_NOM
 
 async def delete_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang  = get_lang(uid(update))
     nom   = update.message.text.strip()
     count = db_delete(uid(update), nom)
-    emoji = "🗑️" if count else "❌"
-    msg   = f"'{nom}' supprimé." if count else f"'{nom}' introuvable."
-    await update.message.reply_text(f"{emoji} {msg}", reply_markup=ReplyKeyboardRemove())
+    msg   = t("deleted", lang, nom=nom) if count else t("not_found", lang, nom=nom)
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Annulé.", reply_markup=ReplyKeyboardRemove())
+    lang = get_lang(uid(update))
+    await update.message.reply_text(t("cancelled", lang), reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -590,52 +1185,91 @@ def main():
     init_db()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(ConversationHandler(
+    # Jobs planifiés (UTC — Paris est UTC+2 en été)
+    app.job_queue.run_daily(
+        morning_job,
+        time=datetime.time(hour=4, minute=0, tzinfo=datetime.timezone.utc),  # 6h00 Paris
+        name="morning_job",
+    )
+    app.job_queue.run_daily(
+        daily_report_job,
+        time=datetime.time(hour=18, minute=30, tzinfo=datetime.timezone.utc),  # 20h30 Paris
+        name="daily_report",
+    )
+
+    # /start + /langue → même conversation de sélection de langue
+    lang_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start",  cmd_start),
+            CommandHandler("langue", cmd_langue),
+        ],
+        states={
+            LANG_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lang_choice)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    # /add
+    add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", add_start)],
         states={
             ADD_NOM:       [MessageHandler(filters.TEXT & ~filters.COMMAND, add_nom)],
             ADD_TYPE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_type)],
+            ADD_DEVISE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_devise)],
             ADD_DATE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_date)],
             ADD_MISE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, add_mise)],
             ADD_VALEUR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_valeur)],
             ADD_RENDEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_rendement)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
-    ))
+    )
 
-    app.add_handler(ConversationHandler(
+    # /update
+    update_conv = ConversationHandler(
         entry_points=[CommandHandler("update", update_start)],
         states={
             UPDATE_NOM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, update_nom)],
             UPDATE_VALEUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_valeur)],
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
-    ))
+    )
 
-    app.add_handler(ConversationHandler(
+    # /sell
+    sell_conv = ConversationHandler(
         entry_points=[CommandHandler("sell", sell_start)],
-        states={
-            SELL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_nom)],
-        },
+        states={SELL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_nom)]},
         fallbacks=[CommandHandler("cancel", conv_cancel)],
-    ))
+    )
 
-    app.add_handler(ConversationHandler(
+    # /delete
+    delete_conv = ConversationHandler(
         entry_points=[CommandHandler("delete", delete_start)],
-        states={
-            DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_nom)],
-        },
+        states={DELETE_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_nom)]},
         fallbacks=[CommandHandler("cancel", conv_cancel)],
-    ))
+    )
 
-    app.add_handler(CommandHandler("start",     cmd_start))
+    # /objectif
+    objectif_conv = ConversationHandler(
+        entry_points=[CommandHandler("objectif", cmd_objectif)],
+        states={OBJECTIF_MONTANT: [MessageHandler(filters.TEXT & ~filters.COMMAND, objectif_montant)]},
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    app.add_handler(lang_conv)
+    app.add_handler(add_conv)
+    app.add_handler(update_conv)
+    app.add_handler(sell_conv)
+    app.add_handler(delete_conv)
+    app.add_handler(objectif_conv)
+
     app.add_handler(CommandHandler("list",      cmd_list))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("total",     cmd_total))
     app.add_handler(CommandHandler("chart",     cmd_chart))
     app.add_handler(CommandHandler("charts",    cmd_charts))
+    app.add_handler(CommandHandler("liberte",   cmd_liberte))
 
-    log.info("Bot portefeuille multi-users démarré.")
+    log.info("Bot patrimoine démarré — 6h00 morning job, 20h30 rapport quotidien.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
