@@ -436,6 +436,11 @@ def init_db():
                     updated_at  TIMESTAMP DEFAULT NOW()
                 )
             """)
+            # Migration automatique : ajoute la colonne devise si elle n'existe pas
+            cur.execute("""
+                ALTER TABLE investments
+                ADD COLUMN IF NOT EXISTS devise TEXT DEFAULT 'EUR'
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_inv_user ON investments(user_id)
             """)
