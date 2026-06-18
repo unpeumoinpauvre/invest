@@ -715,7 +715,13 @@ def row_summary(r, lang="fr"):
     if proj_e is not None:
         lines.append(f"  {t('row_proj', lang)} : {proj_e:+,.2f} €/an")
     if r.get("rendement"):
-        lines.append(f"  {t('row_declared', lang)} : {float(r['rendement']):.1f}%/an")
+        rend = float(r["rendement"])
+        gain_estime_e = mise_e * rend / 100
+        rate = get_eur_usd()
+        lines.append(
+            f"  {t('row_declared', lang)} : {rend:.1f}%/an  "
+            f"→ gain estimé : {gain_estime_e:+,.2f} €/an  ({gain_estime_e*rate:+,.2f} $/an)"
+        )
     if r["vendu"] and r.get("date_vente"):
         lines.append(f"  {t('row_sold_on', lang)} : {r['date_vente'].strftime('%d/%m/%Y')}")
     return "\n".join(lines)
