@@ -1025,7 +1025,28 @@ async def cmd_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text(t("no_active", lang))
         return
-    await update.message.reply_text(total_summary(rows, lang, user_id=uid(update)), parse_mode="HTML")
+    btn_label = "📋 Voir mes positions" if lang == "fr" else "📋 View my positions"
+    btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton(btn_label, callback_data="show_positions")
+    ]])
+    await update.message.reply_text(
+        total_summary(rows, lang, user_id=uid(update)),
+        parse_mode="HTML",
+        reply_markup=btn,
+    )
+
+
+async def on_show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback du bouton 'Voir mes positions'."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_lang(query.from_user.id)
+    rows = db_get_all(query.from_user.id, include_sold=False)
+    if not rows:
+        await query.message.reply_text(t("no_active", lang))
+        return
+    for r in rows:
+        await query.message.reply_text(row_summary(r, lang), parse_mode="HTML")
 
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1665,6 +1686,7 @@ def main():
     app.add_handler(CommandHandler("chart",     cmd_chart))
     app.add_handler(CommandHandler("charts",    cmd_charts))
     app.add_handler(CommandHandler("liberte",   cmd_liberte))
+    app.add_handler(CallbackQueryHandler(on_show_positions, pattern="^show_positions$"))
     app.add_handler(CommandHandler("dettes",    cmd_dettes))
 
     # /dette_add
