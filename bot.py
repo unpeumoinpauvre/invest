@@ -69,6 +69,10 @@ TYPES = ["Crypto", "Crowdlending", "DeFi", "Minage", "Immobilier", "RWA",
          "Pool liquidité", "Vault", "Actions", "Autre"]
 DEVISES = ["EUR (€)", "USD ($)"]
 
+# En dessous de ce nombre de jours, l'annualisation n'a aucun sens
+# (un gain de quelques jours extrapolé sur 1 an donne des chiffres absurdes).
+MIN_DAYS_ANNUALISE = 30
+
 # --------------------------------------------------------------------------- #
 # Traductions FR/EN
 # --------------------------------------------------------------------------- #
@@ -290,8 +294,8 @@ T = {
         "en": "Real gain",
     },
     "annualized": {
-        "fr": "📅 Rendement annualisé moyen pondéré",
-        "en": "📅 Weighted avg annualized return",
+        "fr": "📅 Rendement annuel moyen pondéré (déclaré)",
+        "en": "📅 Weighted avg declared annual yield",
     },
     "annual_proj": {
         "fr": "🎯 Projection annuelle",
@@ -812,6 +816,10 @@ def calc_annualise(mise, valeur, date_entree):
     jours = (datetime.date.today() - date_entree).days
     if jours <= 0:
         return None
+    # Trop récent : l'annualisation extrapolerait un sprint de quelques jours
+    # sur une année entière → chiffres délirants. On s'abstient.
+    if jours < MIN_DAYS_ANNUALISE:
+        return None
     return (float(valeur) - float(mise)) / float(mise) / (jours / 365) * 100
 
 
@@ -865,7 +873,7 @@ def row_summary(r, lang="fr"):
 def total_summary(rows, lang="fr", user_id=None):
     rate = get_eur_usd()
     total_mise_e = total_val_e = 0
-    poids = []
+    poids = []   # (mise_e, rendement_déclaré) — UNIQUEMENT les positions avec un rendement saisi
     for r in rows:
         dev    = r.get("devise") or "EUR"
         mise_n = float(r["mise"])   if r["mise"]   else 0
@@ -874,20 +882,24 @@ def total_summary(rows, lang="fr", user_id=None):
         val_e  = to_eur(val_n,  dev)
         total_mise_e += mise_e
         total_val_e  += val_e
-        ann = calc_annualise(mise_n, val_n, r["date_entree"])
-        if ann is not None:
-            poids.append((mise_e, ann))
+        # On ne prend QUE le rendement annuel déclaré, pas l'évolution de valeur
+        if r.get("rendement"):
+            poids.append((mise_e, float(r["rendement"])))
 
     gain_e = total_val_e - total_mise_e
     pct    = (gain_e / total_mise_e * 100) if total_mise_e else 0
     eg     = "🟢" if gain_e >= 0 else "🔴"
 
     if poids:
-        tp     = sum(m for m, _ in poids)
-        ann_p  = sum(m * a for m, a in poids) / tp
-        proj_e = total_mise_e * ann_p / 100
+        base_mise_e = sum(m for m, _ in poids)
+        # Moyenne des rendements déclarés, pondérée par la mise des positions concernées
+        ann_p  = sum(m * rd for m, rd in poids) / base_mise_e if base_mise_e else None
+        # Projection : uniquement sur la base à rendement déclaré (≡ somme des gains attendus)
+        proj_e = base_mise_e * ann_p / 100 if ann_p is not None else None
+        n_base = len(poids)
     else:
         ann_p = proj_e = None
+        n_base = 0
 
     msg = (
         f"{t('total_title', lang)} — {t('rate_label', lang)} : {rate:.4f}\n\n"
@@ -896,7 +908,9 @@ def total_summary(rows, lang="fr", user_id=None):
         f"{eg} {t('real_gain', lang)} : <b>{gain_e:+,.2f} €  ({gain_e*rate:+,.2f} $)  ({pct:+.2f}%)</b>\n"
     )
     if ann_p is not None:
-        msg += f"\n{t('annualized', lang)} : <b>{ann_p:+.1f}%/an</b>"
+        suffixe = (f"  ({n_base} position(s) à rendement déclaré)" if lang == "fr"
+                   else f"  ({n_base} position(s) with declared yield)")
+        msg += f"\n{t('annualized', lang)} : <b>{ann_p:+.1f}%/an</b>{suffixe}"
     if proj_e is not None:
         msg += f"\n{t('annual_proj', lang)} : <b>{proj_e:+,.2f} €/an  ({proj_e*rate:+,.2f} $/an)</b>"
         msg += f"\n{t('monthly_proj', lang)} : <b>{proj_e/12:+,.2f} €/mois  ({proj_e*rate/12:+,.2f} $/mois)</b>"
