@@ -73,6 +73,22 @@ DEVISES = ["EUR (€)", "USD ($)"]
 # (un gain de quelques jours extrapolé sur 1 an donne des chiffres absurdes).
 MIN_DAYS_ANNUALISE = 30
 
+# Style par type d'actif : (couleur hex pour le donut, pastille emoji pour le texte).
+# Les pastilles carrées ont toutes la même largeur → l'alignement reste propre.
+TYPE_STYLE = {
+    "Crypto":          ("#67AFE0", "🟦"),
+    "Crowdlending":    ("#FDDD07", "🟨"),
+    "DeFi":            ("#E30021", "🟥"),
+    "Minage":          ("#E67E22", "🟧"),
+    "Immobilier":      ("#8B5E3C", "🟫"),
+    "RWA":             ("#9B59B6", "🟪"),
+    "Pool liquidité":  ("#4996CC", "🟦"),
+    "Vault":           ("#1A9850", "🟩"),
+    "Actions":         ("#34495E", "⬛"),
+    "Autre":           ("#95A5A6", "⬜"),
+}
+DEFAULT_TYPE_STYLE = ("#7F8C8D", "⬜")
+
 # --------------------------------------------------------------------------- #
 # Traductions FR/EN
 # --------------------------------------------------------------------------- #
@@ -200,6 +216,18 @@ T = {
     "chart_usage": {
         "fr": "Utilise /chart <nom>\nEx : /chart GoMining",
         "en": "Use /chart <name>\nEx: /chart GoMining",
+    },
+    "top_title": {
+        "fr": "🏆 <b>Top rendements déclarés</b>",
+        "en": "🏆 <b>Top declared yields</b>",
+    },
+    "top_empty": {
+        "fr": "Aucune position avec un rendement déclaré. Ajoute-en un via /add (champ « rendement annuel »).",
+        "en": "No position with a declared yield. Add one via /add (the 'annual yield' field).",
+    },
+    "expo_title": {
+        "fr": "📊 <b>Répartition du portefeuille</b>",
+        "en": "📊 <b>Portfolio breakdown</b>",
     },
     "list_active": {
         "fr": "Actifs",
@@ -354,6 +382,8 @@ T = {
             "/chart — Graphique d'une plateforme\n"
             "/charts — Graphiques de toutes les plateformes\n"
             "/total — Résumé global (€ + $)\n"
+            "/top — Classement des rendements déclarés\n"
+            "/expo — Répartition du portefeuille par type\n"
             "/objectif — Définir ton objectif de liberté financière\n"
             "/liberte — Voir ta barre de progression\n"
             "/list — Liste des investissements\n"
@@ -372,6 +402,8 @@ T = {
             "/chart — Chart for one platform\n"
             "/charts — Charts for all platforms\n"
             "/total — Global summary (€ + $)\n"
+            "/top — Declared yield leaderboard\n"
+            "/expo — Portfolio breakdown by type\n"
             "/objectif — Set your financial freedom goal\n"
             "/liberte — View your progress bar\n"
             "/list — List investments\n"
@@ -992,6 +1024,15 @@ def uid(update): return update.effective_user.id
 def cid(update): return update.effective_chat.id
 
 
+def main_keyboard(lang="fr"):
+    """Clavier inline standard : lien YouTube + bouton 'commandes' (callback)."""
+    label = "📋 Voir les commandes" if lang == "fr" else "📋 View commands"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)],
+        [InlineKeyboardButton(label, callback_data="show_commands")],
+    ])
+
+
 # --------------------------------------------------------------------------- #
 # Jobs quotidiens
 # --------------------------------------------------------------------------- #
@@ -1026,9 +1067,7 @@ async def morning_job(context):
                     reste=f"{reste:,.2f}",
                     pct_restant=pct_restant,
                     message=motiv)
-            yt_btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)
-            ]])
+            yt_btn = main_keyboard(lang)
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML",
                                            reply_markup=yt_btn)
         except Exception as exc:
@@ -1049,9 +1088,7 @@ async def daily_report_job(context):
             date_str = datetime.datetime.now().strftime("%d/%m/%Y")
             header   = t("daily_report_header", lang, date=date_str)
             msg      = f"{header}\n\n" + total_summary(rows, lang, user_id=user_id)
-            yt_btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton("▶️ YouTube — Un Peu Moins Pauvre", url=YOUTUBE_URL)
-            ]])
+            yt_btn = main_keyboard(lang)
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML",
                                            reply_markup=yt_btn)
         except Exception as exc:
@@ -1227,6 +1264,14 @@ async def on_show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(row_summary(r, lang), parse_mode="HTML")
 
 
+async def on_show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback du bouton 'Voir les commandes' (messages matin/soir)."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_lang(query.from_user.id)
+    await query.message.reply_text(t("commands", lang), parse_mode="HTML")
+
+
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_lang(uid(update))
     if context.args:
@@ -1271,6 +1316,93 @@ async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t("generating", lang, n=len(rows)))
     for r in rows:
         await send_chart(update.message, r)
+
+
+# --------------------------------------------------------------------------- #
+# /top — classement des rendements déclarés
+# --------------------------------------------------------------------------- #
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    rows = db_get_all(uid(update), include_sold=False)
+    ranked = [r for r in rows if r.get("rendement")]
+    if not ranked:
+        await update.message.reply_text(t("top_empty", lang))
+        return
+    ranked.sort(key=lambda r: float(r["rendement"]), reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [t("top_title", lang), ""]
+    for i, r in enumerate(ranked):
+        prefix = medals[i] if i < 3 else f"{i+1:>2}."
+        lines.append(f"{prefix} {r['nom']} — {float(r['rendement']):.1f} %/an")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# --------------------------------------------------------------------------- #
+# /expo — répartition du portefeuille par type d'actif
+# --------------------------------------------------------------------------- #
+def exposure_by_type(rows):
+    """Agrège la valeur actuelle (en €) par type d'actif. Renvoie une liste triée desc."""
+    agg = {}
+    for r in rows:
+        dev   = r.get("devise") or "EUR"
+        val_n = float(r["valeur"]) if r["valeur"] else float(r["mise"])
+        val_e = to_eur(val_n, dev)
+        typ   = r["type"] or "Autre"
+        agg[typ] = agg.get(typ, 0) + val_e
+    return sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def make_exposure_chart(items, total):
+    """Donut de répartition par type, aux couleurs UPMP."""
+    labels  = [typ for typ, _ in items]
+    vals    = [v for _, v in items]
+    couleurs = [TYPE_STYLE.get(typ, DEFAULT_TYPE_STYLE)[0] for typ in labels]
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    fig.patch.set_facecolor("#f3f8fc")
+    wedges, _ = ax.pie(
+        vals, colors=couleurs, startangle=90,
+        wedgeprops=dict(width=0.42, edgecolor="#f3f8fc", linewidth=2),
+    )
+    ax.set_title("Répartition de mon portefeuille", fontsize=15,
+                 fontweight="bold", color="#010101", pad=18)
+    leg = [f"{l} — {v/total*100:.1f}%  ({v:,.0f} €)" for l, v in zip(labels, vals)]
+    ax.legend(wedges, leg, loc="center left", bbox_to_anchor=(0.92, 0.5),
+              fontsize=10, frameon=False)
+    ax.text(0, 0, f"{total:,.0f} €\ntotal", ha="center", va="center",
+            fontsize=13, fontweight="bold", color="#4996cc")
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=120, facecolor="#f3f8fc", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def cmd_expo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(uid(update))
+    rows = db_get_all(uid(update), include_sold=False)
+    if not rows:
+        await update.message.reply_text(t("no_active", lang))
+        return
+    items = exposure_by_type(rows)
+    total = sum(v for _, v in items)
+    if total <= 0:
+        await update.message.reply_text(t("no_active", lang))
+        return
+    buf = make_exposure_chart(items, total)
+    # Texte d'accompagnement (style A) — pastilles alignées via <pre>
+    lignes = []
+    for typ, val_e in items:
+        emoji = TYPE_STYLE.get(typ, DEFAULT_TYPE_STYLE)[1]
+        pct   = val_e / total * 100
+        lignes.append(f"{emoji} {typ:<15}{pct:>5.1f}%  {val_e:>10,.0f} €")
+    caption = (
+        f"{t('expo_title', lang)} — <b>{total:,.0f} €</b>\n\n"
+        f"<pre>" + "\n".join(lignes) + "</pre>"
+    )
+    await update.message.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
 
 
 # --------------------------------------------------------------------------- #
@@ -1870,8 +2002,11 @@ def main():
     app.add_handler(CommandHandler("total",     cmd_total))
     app.add_handler(CommandHandler("chart",     cmd_chart))
     app.add_handler(CommandHandler("charts",    cmd_charts))
+    app.add_handler(CommandHandler("top",       cmd_top))
+    app.add_handler(CommandHandler("expo",      cmd_expo))
     app.add_handler(CommandHandler("liberte",   cmd_liberte))
     app.add_handler(CallbackQueryHandler(on_show_positions, pattern="^show_positions$"))
+    app.add_handler(CallbackQueryHandler(on_show_commands,  pattern="^show_commands$"))
     app.add_handler(CommandHandler("dettes",    cmd_dettes))
 
     # /dette_add
