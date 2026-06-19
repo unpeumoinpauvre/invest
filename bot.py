@@ -66,7 +66,7 @@ log = logging.getLogger("upmp-portfolio")
  DEBT_DELETE_NOM) = range(22)
 
 TYPES = ["Crypto", "Crowdlending", "DeFi", "Minage", "Immobilier", "RWA",
-         "Pool liquidité", "Vault", "Actions", "Autre"]
+         "Pool liquidité", "Matière première", "Actions", "Autre"]
 DEVISES = ["EUR (€)", "USD ($)"]
 
 # En dessous de ce nombre de jours, l'annualisation n'a aucun sens
@@ -83,7 +83,7 @@ TYPE_STYLE = {
     "Immobilier":      ("#8B5E3C", "🟫"),
     "RWA":             ("#9B59B6", "🟪"),
     "Pool liquidité":  ("#4996CC", "🟦"),
-    "Vault":           ("#1A9850", "🟩"),
+    "Matière première":("#16A085", "🟩"),
     "Actions":         ("#34495E", "⬛"),
     "Autre":           ("#95A5A6", "⬜"),
 }
