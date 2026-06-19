@@ -530,6 +530,20 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
+            # Historique des valeurs : 1 ligne par mouvement (mise initiale, /update…)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS investment_history (
+                    id          SERIAL PRIMARY KEY,
+                    inv_id      INTEGER NOT NULL REFERENCES investments(id) ON DELETE CASCADE,
+                    user_id     BIGINT NOT NULL,
+                    valeur      NUMERIC(12,2) NOT NULL,
+                    ts          TIMESTAMP NOT NULL DEFAULT NOW(),
+                    note        TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_hist_inv ON investment_history(inv_id)
+            """)
         conn.commit()
     log.info("DB initialisée.")
 
@@ -591,8 +605,24 @@ def db_add(user_id, nom, type_, devise, date_entree, mise, valeur, rendement):
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
             """, (user_id, nom, type_, devise, date_entree, mise, valeur, rendement))
             row = cur.fetchone()
+            inv_id = row["id"]
+            # Historique : point de mise initiale (à la date d'entrée)
+            d0 = date_entree or datetime.date.today()
+            cur.execute(
+                "INSERT INTO investment_history (inv_id, user_id, valeur, ts, note) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (inv_id, user_id, mise,
+                 datetime.datetime.combine(d0, datetime.time()), "Mise initiale")
+            )
+            # Si une valeur actuelle différente est saisie dès l'ajout, on l'enregistre
+            if valeur is not None and float(valeur) != float(mise):
+                cur.execute(
+                    "INSERT INTO investment_history (inv_id, user_id, valeur, ts, note) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (inv_id, user_id, valeur, datetime.datetime.now(), "Valeur de départ")
+                )
         conn.commit()
-    return row["id"]
+    return inv_id
 
 
 def db_update(user_id, nom, valeur):
@@ -601,8 +631,17 @@ def db_update(user_id, nom, valeur):
             cur.execute("""
                 UPDATE investments SET valeur=%s, updated_at=NOW()
                 WHERE user_id=%s AND LOWER(nom)=LOWER(%s) AND vendu=FALSE
+                RETURNING id
             """, (valeur, user_id, nom))
+            rows  = cur.fetchall()
             count = cur.rowcount
+            # Historique : un point par investissement mis à jour
+            for r in rows:
+                cur.execute(
+                    "INSERT INTO investment_history (inv_id, user_id, valeur, ts, note) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (r["id"], user_id, valeur, datetime.datetime.now(), "Mise à jour")
+                )
         conn.commit()
     return count
 
@@ -666,6 +705,102 @@ def db_list_names(user_id, include_sold=False):
             q += " ORDER BY nom"
             cur.execute(q, (user_id,))
             return [r["nom"] for r in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------- #
+# Historique des valeurs
+# --------------------------------------------------------------------------- #
+def history_get(inv_id):
+    """Tous les points d'historique d'un investissement, du plus ancien au plus récent."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM investment_history WHERE inv_id=%s ORDER BY ts, id",
+                (inv_id,)
+            )
+            return cur.fetchall()
+
+
+def backfill_history():
+    """Crée un historique de départ pour les investissements existants qui n'en ont pas.
+    Idempotent : ne touche pas ceux qui ont déjà des points."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM investments")
+            invs = cur.fetchall()
+            n = 0
+            for r in invs:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM investment_history WHERE inv_id=%s",
+                    (r["id"],)
+                )
+                if cur.fetchone()["c"] > 0:
+                    continue
+                # point de mise initiale
+                if r["date_entree"]:
+                    d0 = r["date_entree"]
+                elif r.get("created_at"):
+                    d0 = r["created_at"].date()
+                else:
+                    d0 = datetime.date.today()
+                cur.execute(
+                    "INSERT INTO investment_history (inv_id, user_id, valeur, ts, note) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (r["id"], r["user_id"], r["mise"],
+                     datetime.datetime.combine(d0, datetime.time()), "Mise initiale")
+                )
+                # point de valeur actuelle si différente de la mise
+                if r["valeur"] is not None and float(r["valeur"]) != float(r["mise"]):
+                    ts = r["updated_at"] or datetime.datetime.now()
+                    cur.execute(
+                        "INSERT INTO investment_history (inv_id, user_id, valeur, ts, note) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (r["id"], r["user_id"], r["valeur"], ts, "Valeur actuelle")
+                    )
+                n += 1
+        conn.commit()
+    log.info("Backfill historique : %d investissement(s) initialisé(s).", n)
+
+
+def build_chart_points(r):
+    """Construit la liste des points (ts, valeur en devise d'origine) à tracer.
+    Garantit toujours un point 'aujourd'hui' avec la valeur courante."""
+    pts = history_get(r["id"])
+    points = [{"ts": p["ts"], "valeur": float(p["valeur"]), "note": p.get("note")}
+              for p in pts]
+    # Fallback si aucun historique (sécurité)
+    if not points:
+        d0 = r["date_entree"] or datetime.date.today()
+        points.append({
+            "ts": datetime.datetime.combine(d0, datetime.time()),
+            "valeur": float(r["mise"]), "note": "Mise initiale",
+        })
+    # Toujours terminer sur la valeur actuelle à aujourd'hui
+    cur_val = float(r["valeur"]) if r["valeur"] is not None else float(r["mise"])
+    last = points[-1]
+    if last["ts"].date() != datetime.date.today() or abs(last["valeur"] - cur_val) > 0.01:
+        points.append({
+            "ts": datetime.datetime.now(), "valeur": cur_val, "note": "Aujourd'hui",
+        })
+    return points
+
+
+def changelog_text(r, points):
+    """Ligne info des mouvements : '+100$ le 10/06/2026'."""
+    devise = r.get("devise") or "EUR"
+    sym    = "$" if devise == "USD" else "€"
+    lines  = []
+    for i, p in enumerate(points):
+        d = p["ts"].strftime("%d/%m/%Y")
+        if i == 0:
+            lines.append(f"• Mise initiale : {p['valeur']:,.2f} {sym} le {d}")
+            continue
+        delta = p["valeur"] - points[i - 1]["valeur"]
+        if abs(delta) < 0.01:
+            continue
+        emoji = "🟢" if delta >= 0 else "🔴"
+        lines.append(f"• {emoji} {delta:+,.0f} {sym} le {d}  → {p['valeur']:,.2f} {sym}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -780,30 +915,51 @@ def total_summary(rows, lang="fr", user_id=None):
 # --------------------------------------------------------------------------- #
 # Graphique
 # --------------------------------------------------------------------------- #
-def make_chart(nom, mise_eur, val_eur, date_entree, ann):
-    fig, ax = plt.subplots(figsize=(8, 4))
+def make_chart(nom, devise, points, ann):
+    """Trace la courbe à partir de la liste complète des points d'historique.
+    points : liste de dicts {'ts': datetime, 'valeur': float (en devise d'origine)}."""
+    sym = "$" if devise == "USD" else "€"
+    xs       = [p["ts"] for p in points]
+    vals_dev = [float(p["valeur"]) for p in points]
+    ys       = [to_eur(v, devise) for v in vals_dev]   # axe en €
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
     fig.patch.set_facecolor("#f3f8fc")
     ax.set_facecolor("#f3f8fc")
-    today = datetime.date.today()
-    d0    = date_entree or today
 
-    ax.plot([d0, today], [mise_eur, val_eur],
-            color="#4996cc", linewidth=2.5, marker="o", markersize=6, label="Valeur réelle (€)")
+    ax.plot(xs, ys, color="#4996cc", linewidth=2.5, marker="o", markersize=7,
+            label="Valeur réelle (€)", zorder=3)
 
-    if ann is not None and date_entree:
-        d1 = date_entree + datetime.timedelta(days=365)
-        ax.plot([date_entree, d1],
-                [mise_eur, mise_eur * (1 + ann / 100)],
-                color="#fddd07", linewidth=1.5, linestyle="--",
-                label=f"Projection ({ann:+.1f}%/an)")
-
+    mise_eur = ys[0]
     ax.axhline(mise_eur, color="#e30021", linewidth=1, linestyle=":",
                label=f"Mise : {mise_eur:,.0f} €")
+
+    # Annotation des variations entre chaque point (dans la devise d'origine)
+    for i in range(1, len(points)):
+        delta_dev = vals_dev[i] - vals_dev[i - 1]
+        if abs(delta_dev) < 0.01:
+            continue
+        couleur = "#1a9850" if delta_dev >= 0 else "#e30021"
+        ax.annotate(
+            f"{delta_dev:+,.0f} {sym}",
+            xy=(xs[i], ys[i]),
+            xytext=(0, 12 if delta_dev >= 0 else -18),
+            textcoords="offset points",
+            ha="center", fontsize=8, fontweight="bold", color=couleur, zorder=4,
+        )
+
+    # Projection à partir du dernier point connu
+    if ann is not None and len(xs) >= 1:
+        last_x = xs[-1]
+        d1     = last_x + datetime.timedelta(days=365)
+        ax.plot([last_x, d1], [ys[-1], ys[-1] * (1 + ann / 100)],
+                color="#fddd07", linewidth=1.5, linestyle="--",
+                label=f"Projection ({ann:+.1f}%/an)")
 
     ax.set_title(nom, fontsize=14, fontweight="bold", color="#010101")
     ax.set_ylabel("Valeur (€)", color="#5b6b78")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:,.0f} €"))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m/%y"))
     fig.autofmt_xdate()
     ax.legend(fontsize=9)
     ax.spines["top"].set_visible(False)
@@ -1065,12 +1221,7 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not r:
             await update.message.reply_text(t("not_found", lang, nom=nom))
             return
-        dev  = r.get("devise") or "EUR"
-        me   = to_eur(float(r["mise"]),   dev)
-        ve   = to_eur(float(r["valeur"]), dev)
-        ann  = calc_annualise(float(r["mise"]), float(r["valeur"]), r["date_entree"])
-        buf  = make_chart(r["nom"], me, ve, r["date_entree"], ann)
-        await update.message.reply_photo(photo=buf, caption=f"📈 {r['nom']}")
+        await send_chart(update.message, r)
     else:
         noms = db_list_names(uid(update))
         if not noms:
@@ -1081,6 +1232,22 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def send_chart(message, r):
+    """Génère et envoie le graphique + la ligne info des mouvements."""
+    dev    = r.get("devise") or "EUR"
+    points = build_chart_points(r)
+    ann    = calc_annualise(float(r["mise"]), float(r["valeur"]), r["date_entree"])
+    buf    = make_chart(r["nom"], dev, points, ann)
+    mouvements = changelog_text(r, points)
+    caption = f"📈 <b>{r['nom']}</b>\n\n📝 <b>Mouvements :</b>\n{mouvements}"
+    # Telegram limite la légende à ~1024 caractères
+    if len(caption) <= 1000:
+        await message.reply_photo(photo=buf, caption=caption, parse_mode="HTML")
+    else:
+        await message.reply_photo(photo=buf, caption=f"📈 {r['nom']}")
+        await message.reply_text(f"📝 <b>Mouvements :</b>\n{mouvements}", parse_mode="HTML")
+
+
 async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_lang(uid(update))
     rows = db_get_all(uid(update), include_sold=False)
@@ -1089,12 +1256,7 @@ async def cmd_charts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(t("generating", lang, n=len(rows)))
     for r in rows:
-        dev = r.get("devise") or "EUR"
-        me  = to_eur(float(r["mise"]),   dev)
-        ve  = to_eur(float(r["valeur"]), dev)
-        ann = calc_annualise(float(r["mise"]), float(r["valeur"]), r["date_entree"])
-        buf = make_chart(r["nom"], me, ve, r["date_entree"], ann)
-        await update.message.reply_photo(photo=buf, caption=f"📈 {r['nom']}")
+        await send_chart(update.message, r)
 
 
 # --------------------------------------------------------------------------- #
@@ -1609,6 +1771,7 @@ async def dette_delete_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     init_db_debts()
+    backfill_history()   # historise les investissements existants (1 seule fois)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Jobs planifiés (UTC — Paris est UTC+2 en été)
@@ -1735,4 +1898,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
